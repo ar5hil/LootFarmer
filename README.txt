@@ -166,5 +166,6 @@ GOOD TO KNOW ON A MAC
   well clear of the threshold.
 - Tesseract on macOS reads clean digits fine; the in-game numbers are read with the bot's
   own digit templates (no Tesseract), which were verified on BlueStacks Air.
-- The "Anywhere" phone link needs cloudflared (setup installs it); the Home Wi-Fi link works
-  without it. Groq and the Discord webhook work exactly as on Windows.
+- The phone link is the "Anywhere link" under the title (v17 dropped the Home Wi-Fi one): it needs
+  cloudflared, which setup installs, and it is posted to your Discord when the app starts.
+- Groq and the Discord webhook work exactly as on Windows.
