@@ -78,11 +78,65 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
-# Shipped inside the bot folder so nothing needs installing (used when the configured path doesn't exist)
-BUNDLED = {"adb_path": os.path.join(BASE_DIR, "platform-tools", "adb.exe"),
-           "tesseract_path": os.path.join(BASE_DIR, "Tesseract-OCR", "tesseract.exe")}
 os.makedirs(TEMPLATE_DIR, exist_ok=True)
-NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # no console flash per adb call
+
+# ---------------------------------------------------------------------------
+# Platform: Windows = BlueStacks 5, macOS = BlueStacks Air (Apple silicon)
+# ---------------------------------------------------------------------------
+IS_WIN = os.name == "nt"
+IS_MAC = sys.platform == "darwin"
+BS_APP_MAC = "/Applications/BlueStacks.app"
+BS_CONF_MAC = "/Users/Shared/Library/Application Support/BlueStacks/bluestacks.conf"
+
+
+def _first_path(*paths):
+    """The first of these that exists on this machine, or ""."""
+    for p in paths:
+        if p and os.path.exists(p):
+            return p
+    return ""
+
+
+if IS_MAC:
+    # BlueStacks Air ships its own adb (hd-adb): using it keeps client and server in step. Homebrew
+    # (brew install android-platform-tools) or Google's platform-tools work just as well.
+    BUNDLED = {"adb_path": _first_path(os.path.join(BS_APP_MAC, "Contents", "MacOS", "hd-adb"),
+                                       shutil.which("adb"), "/opt/homebrew/bin/adb", "/usr/local/bin/adb"),
+               "tesseract_path": _first_path(shutil.which("tesseract"), "/opt/homebrew/bin/tesseract",
+                                             "/usr/local/bin/tesseract")}
+else:
+    # Shipped inside the bot folder so nothing needs installing (used when the configured path doesn't exist)
+    BUNDLED = {"adb_path": os.path.join(BASE_DIR, "platform-tools", "adb.exe"),
+               "tesseract_path": os.path.join(BASE_DIR, "Tesseract-OCR", "tesseract.exe")}
+NO_WINDOW = 0x08000000 if IS_WIN else 0  # no console flash per adb call
+DETACHED = {"creationflags": 0x00000008} if IS_WIN else {"start_new_session": True}  # outlive this process
+# cloudflared also gets its own process group on Windows (Ctrl+C in the parent's console must not reach it)
+DETACHED_TUNNEL = ({"creationflags": 0x00000008 | 0x00000200} if IS_WIN else {"start_new_session": True})
+UI_FONT = "Segoe UI" if IS_WIN else "Helvetica Neue"  # macOS has no Segoe UI; Tk substitutes an ugly one
+MONO_FONT = "Consolas" if IS_WIN else "Menlo"
+
+
+def open_path(path):
+    """Open a file or folder in the desktop's default program."""
+    if IS_WIN:
+        os.startfile(path)
+    else:
+        subprocess.run(["open" if IS_MAC else "xdg-open", path], check=False)
+
+
+def host_name():
+    """This machine's name (COMPUTERNAME exists only on Windows)."""
+    uname = getattr(os, "uname", None)  # socket is not imported any more
+    return os.environ.get("COMPUTERNAME") or (uname().nodename.split(".")[0] if uname else "") or "a PC"
+
+
+def python_gui_exe():
+    """sys.executable, but pythonw.exe on Windows so restarting the app doesn't flash a console window."""
+    exe = sys.executable
+    if IS_WIN and exe.lower().endswith("python.exe") and os.path.exists(exe[:-10] + "pythonw.exe"):
+        exe = exe[:-10] + "pythonw.exe"
+    return exe
+
 
 BUTTONS = [
     ("attack_button", "Attack! (home screen)"),
@@ -157,7 +211,8 @@ STATE_LABELS = {
 }
 
 DEFAULTS = {
-    "adb_path": r"C:\Program Files\platform-tools\adb.exe",
+    "adb_path": (r"C:\Program Files\platform-tools\adb.exe" if IS_WIN
+                 else (BUNDLED["adb_path"] or "/opt/homebrew/bin/adb")),
     "device": "",
     "auto_connect_target": "127.0.0.1:5555",
     "match_confidence": 0.7,
@@ -213,7 +268,8 @@ DEFAULTS = {
     "game_launch_wait": 25,
     "emulator_boot_wait": 40,
     "adb_ready_timeout": 90,
-    "tesseract_path": r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    "tesseract_path": (r"C:\Program Files\Tesseract-OCR\tesseract.exe" if IS_WIN
+                       else (BUNDLED["tesseract_path"] or "/opt/homebrew/bin/tesseract")),
     "ocr_region_padding_px": 4,
     "ocr_min_digits": 3,
     "groq_api_key": "",
@@ -350,8 +406,8 @@ def load_config():
             cfg[k] = path
     cfg["bb_bonus_days"] = dict(cfg.get("bb_bonus_days") or {})
     cfg["discord_webhook"] = cfg.get("discord_webhook") or DEFAULTS["discord_webhook"]  # blank saved = the built-in
-    player = r"C:\Program Files\BlueStacks_nxt\HD-Player.exe"
-    if not os.path.isfile(cfg.get("emulator_exe_path") or "") and os.path.isfile(player):
+    player = r"C:\Program Files\BlueStacks_nxt\HD-Player.exe" if IS_WIN else BS_APP_MAC
+    if not os.path.exists(cfg.get("emulator_exe_path") or "") and os.path.exists(player):
         cfg["emulator_exe_path"] = player  # so crash recovery can restart BlueStacks
     return cfg, err
 
@@ -635,13 +691,17 @@ def ocr_number(frame, bbox, pad=4, min_digits=1, thorough=True):
         d = re.sub(r"\D", "", txt)
         return int(d) if len(d) >= min_digits else None
 
-    v = read(otsu, 7)
+    # psm 8 = "a single word" is the right model for a crop that is nothing but a number, and it is the
+    # reliable one across tesseract builds (psm 7/6 misread 3 as 5 with tesseract 5.5 on macOS).
+    v = read(otsu, 8)
     if v is not None or not thorough:
-        return v if v is not None else read(cv2.bitwise_not(otsu), 7)
+        return v if v is not None else read(cv2.bitwise_not(otsu), 8)
     variants = [otsu, cv2.bitwise_not(otsu),
                 cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5),
                 cv2.dilate(otsu, np.ones((2, 2), np.uint8))]
-    results = [r for img in variants for psm in (7, 8, 6) if (r := read(img, psm)) is not None]
+    results = [r for img in variants if (r := read(img, 8)) is not None]
+    if not results:  # unusual crop: fall back to the line / block models
+        results = [r for img in variants for psm in (7, 6) if (r := read(img, psm)) is not None]
     if not results:
         return None
     counts = {r: results.count(r) for r in results}
@@ -1121,10 +1181,13 @@ def walls_left(sd):
 
 
 def read_clipboard():
-    """Windows clipboard text ('' if none). BlueStacks copies Android's clipboard here."""
+    """Clipboard text ('' if none). BlueStacks copies Android's clipboard to the desktop's clipboard, so the
+    game's exported base data can be read straight from it: Get-Clipboard on Windows, pbpaste on macOS."""
+    cmd = (["pbpaste"] if IS_MAC else
+           ["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"])
     try:
-        return subprocess.run(["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"], capture_output=True,
-                              text=True, timeout=15, creationflags=NO_WINDOW).stdout or ""
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=15,
+                              creationflags=NO_WINDOW).stdout or ""
     except Exception:
         return ""
 
@@ -3000,7 +3063,7 @@ class Bot:
 
     # --- recovery ---
     def emulator_restart_allowed(self):
-        return self.cfg["watchdog_enabled"] and os.path.isfile(self.cfg["emulator_exe_path"])
+        return self.cfg["watchdog_enabled"] and os.path.exists(self.cfg["emulator_exe_path"])
 
     def launch_game(self):
         pkg, act = self.cfg["coc_package_name"], self.cfg["coc_activity_name"]
@@ -3081,16 +3144,20 @@ class Bot:
         """Buttons, drop lines and text boxes are all 1920x1080 pixels. The monitor doesn't matter (screenshots
         come from inside the emulator), but BlueStacks' own resolution does: set it back and restart BlueStacks."""
         h, w = frame.shape[:2]
-        conf = r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf"
+        conf = BS_CONF
         if getattr(self, "_res_fixed", False) or not self.emulator_restart_allowed() or not os.path.exists(conf):
             self.log(f"The emulator is {w}x{h} but must be 1920x1080: BlueStacks Settings > Display > "
-                     "1920x1080, DPI 240, then restart BlueStacks.", "err")
+                     + ("1920x1080, DPI 240" if IS_WIN else "Landscape/1920x1080")
+                     + ", then restart BlueStacks.", "err")
             self.sleep(60)
             return
         self._res_fixed = True
         self.log(f"The emulator is {w}x{h} - setting BlueStacks to 1920x1080 and restarting it.", "warn")
 
-        self.restart_emulator(while_closed=lambda: bs_conf_set({"fb_width": "1920", "fb_height": "1080", "dpi": "240"}))
+        # BlueStacks Air keeps its panel config in portrait (1080x1920) and rotates it for landscape.
+        want = ({"fb_width": "1920", "fb_height": "1080", "dpi": "240"} if IS_WIN
+                else {"fb_width": "1080", "fb_height": "1920", "dpi": "320"})
+        self.restart_emulator(while_closed=lambda: bs_conf_set(want))
 
     def restart_emulator(self, while_closed=None):
         now = time.time()
@@ -3102,8 +3169,15 @@ class Bot:
         exe = self.cfg["emulator_exe_path"]
         self.log("Restarting the emulator...", "err")
         self.adb.close_shell()
-        subprocess.run(["taskkill", "/IM", os.path.basename(exe), "/T", "/F"], capture_output=True,
-                       timeout=20, creationflags=NO_WINDOW)
+        if IS_MAC:
+            subprocess.run(["osascript", "-e", 'quit app "BlueStacks"'], capture_output=True, timeout=30)
+            self.sleep(5)
+            if process_running(exe):  # refused to quit politely
+                subprocess.run(["pkill", "-f", "BlueStacks.app/Contents/MacOS/BlueStacks"],
+                               capture_output=True, timeout=20)
+        else:
+            subprocess.run(["taskkill", "/IM", os.path.basename(exe), "/T", "/F"], capture_output=True,
+                           timeout=20, creationflags=NO_WINDOW)
         self.sleep(5)
         try:  # BlueStacks rewrites its conf on exit, so settings are changed only while it's closed
             bs_conf_set(GFX_PROFILES[min(int(self.cfg.get("gfx_profile", 0)), len(GFX_PROFILES) - 1)][1])
@@ -3111,7 +3185,13 @@ class Bot:
                 while_closed()
         except OSError as e:
             self.log(f"Couldn't change BlueStacks' settings: {e}", "err")
-        subprocess.Popen([exe, *self.cfg["emulator_launch_args"].split()], creationflags=0x00000008)  # detached
+        if IS_MAC:
+            args = ["open", "-a", "BlueStacks"]
+            if self.cfg["emulator_launch_args"].split():
+                args += ["--args", *self.cfg["emulator_launch_args"].split()]
+            subprocess.run(args, capture_output=True, timeout=30)
+        else:
+            subprocess.Popen([exe, *self.cfg["emulator_launch_args"].split()], **DETACHED)
         self.sleep(self.cfg["emulator_boot_wait"])
         end = time.time() + self.cfg["adb_ready_timeout"]
         while time.time() < end:
@@ -3198,7 +3278,14 @@ class PhoneView:
 
 
 def _pid_image(pid):
-    """Full exe path of a running process, or None if it isn't running (Windows)."""
+    """Executable path of a running process, or None if it isn't running."""
+    if IS_MAC:
+        try:
+            r = subprocess.run(["ps", "-p", str(int(pid)), "-o", "comm="], capture_output=True, text=True, timeout=5)
+            return r.stdout.strip() or None
+        except Exception:
+            return None
+    import ctypes
     k32 = ctypes.windll.kernel32
     h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
     if not h:
@@ -3226,13 +3313,14 @@ class Tunnel:
 
     def _alive(self, st):
         img = _pid_image(st.get("pid", 0)) if st else None
-        return bool(img and img.lower().endswith("cloudflared.exe") and st.get("port") == self.port)
+        return bool(img and img.lower().endswith("cloudflared.exe" if IS_WIN else "cloudflared")
+                    and st.get("port") == self.port)
 
     def _start(self):
         with open(self.LOG, "w") as lf:
             proc = subprocess.Popen([self.exe, "tunnel", "--no-autoupdate", "--url", f"http://localhost:{self.port}"],
                                     stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                    creationflags=0x00000008 | 0x00000200)  # DETACHED | NEW_PROCESS_GROUP
+                                    **DETACHED_TUNNEL)
         for _ in range(60):
             time.sleep(1)
             try:
@@ -3297,7 +3385,13 @@ class Tunnel:
 
     @staticmethod
     def _kill(st):
-        subprocess.run(["taskkill", "/PID", str(st["pid"]), "/F"], capture_output=True, creationflags=NO_WINDOW)
+        if IS_WIN:
+            subprocess.run(["taskkill", "/PID", str(st["pid"]), "/F"], capture_output=True, creationflags=NO_WINDOW)
+        else:
+            try:
+                os.kill(int(st["pid"]), 15)  # SIGTERM
+            except Exception:
+                pass
         time.sleep(1)
 
     @staticmethod
@@ -3326,9 +3420,13 @@ class Tunnel:
         """Stop a background tunnel left running (used when the public link is turned off)."""
         try:
             st = json.load(open(Tunnel.STATE))
-            if (_pid_image(st["pid"]) or "").lower().endswith("cloudflared.exe"):
-                subprocess.run(["taskkill", "/PID", str(st["pid"]), "/F"], capture_output=True,
-                               creationflags=NO_WINDOW)
+            img = (_pid_image(st["pid"]) or "").lower()
+            if img.endswith("cloudflared.exe" if IS_WIN else "cloudflared"):
+                if IS_WIN:
+                    subprocess.run(["taskkill", "/PID", str(st["pid"]), "/F"], capture_output=True,
+                                   creationflags=NO_WINDOW)
+                else:
+                    os.kill(int(st["pid"]), 15)  # SIGTERM
         except Exception:
             pass
 
@@ -3351,7 +3449,8 @@ def pan_view(adb, where, frame_w=1920, frame_h=1080):
         time.sleep(0.15)
 
 
-BS_CONF = r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf"
+BS_CONF = r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf" if IS_WIN else _first_path(
+    BS_CONF_MAC, os.path.expanduser("~/Library/Application Support/BlueStacks/bluestacks.conf")) or BS_CONF_MAC
 # Graphics setups to try, in order, when BlueStacks keeps crashing (typically on the game's loading clouds - a
 # graphics-driver crash, e.g. NVIDIA + Vulkan). 0 = leave BlueStacks as the user set it.
 GFX_PROFILES = [
@@ -3378,6 +3477,13 @@ def bs_conf_set(values):
 
 def process_running(exe):
     try:
+        if IS_MAC:
+            # BlueStacks Air's engine runs as /Applications/BlueStacks.app/Contents/MacOS/BlueStacks
+            if exe.rstrip("/").endswith(".app"):
+                cmd = ["pgrep", "-f", os.path.basename(exe.rstrip("/"))[:-4] + ".app/Contents/MacOS/"]
+            else:
+                cmd = ["pgrep", "-x", os.path.basename(exe)]
+            return bool(subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout.strip())
         out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {os.path.basename(exe)}", "/NH"], capture_output=True,
                              text=True, timeout=15, creationflags=NO_WINDOW).stdout
     except Exception:
@@ -3432,8 +3538,18 @@ def post_discord(cfg, text, files=()):
 def single_instance():
     """A machine-wide lock so only one Loot Farmer drives the emulator. Waits a few seconds first, so the
     Restart / Update buttons (new copy starts while the old one closes) still work. None = another is running."""
-    if os.name != "nt":
-        return True
+    if not IS_WIN:
+        import fcntl
+        lock_path = os.path.join(tempfile.gettempdir(), "LootFarmerBot.lock")
+        for _ in range(20):
+            try:
+                fh = open(lock_path, "w")
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fh  # held for as long as this process lives
+            except OSError:
+                time.sleep(0.5)
+        return None
+    import ctypes
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.CreateMutexW.restype = ctypes.c_void_p
     k32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
@@ -3449,6 +3565,7 @@ def single_instance():
 
 
 _TOUCH = {}
+TOUCH_TMP = "/data/local/tmp/lootfarmer_touch"  # scratch file for raw events on macOS (see touch_event_writer)
 
 
 def touch_device(adb):
@@ -3483,6 +3600,48 @@ def touch_ev(adb):
     return _TOUCH["ev"]
 
 
+def touch_panel_rotated(adb, W=1920, H=1080):
+    """True when the touch panel is a portrait panel shown rotated (BlueStacks Air on macOS: the emulator
+    reports a 1080x1920 panel and rotates it, so raw touch axes are swapped against the 1920x1080 screenshot).
+    Verified on the emulator with Android's pointer-location overlay. BlueStacks 5 on Windows is natively
+    landscape, so this is False there."""
+    if "rot" not in _TOUCH:
+        rot = False
+        try:
+            m = re.search(r"Physical size:\s*(\d+)x(\d+)", adb.shell("wm size", timeout=10))
+            if m:
+                pw, ph = int(m.group(1)), int(m.group(2))
+                rot = ph > pw and W > H  # portrait panel, landscape screen
+        except ADBError:
+            pass
+        _TOUCH["rot"] = rot
+    return _TOUCH["rot"]
+
+
+def touch_raw(x, y, mx, my, W=1920, H=1080, rotated=False):
+    """Screenshot (landscape) pixel -> raw touch-device coordinate."""
+    if rotated:  # panel turned 90 degrees: screen x runs along raw y, screen y is mirrored along raw x
+        return int((H - y) / H * mx), int(x / W * my)
+    return int(x / W * mx), int(y / H * my)
+
+
+def touch_writer(dev, ev):
+    """write_seq(events): the shell command that pushes them to the touch device as whole input_events.
+    Windows takes the decoded struct in one write. macOS/BlueStacks Air does NOT: toybox's base64 writes the
+    decoded bytes in 3-byte pieces, and the kernel rejects anything that isn't a whole event (EINVAL), so every
+    pinch silently did nothing - decode to a file, then dd it out in exact event-sized blocks instead."""
+    size = len(ev(0, 0, 0))
+
+    def write(seq):
+        data = base64.b64encode(seq).decode()
+        if IS_MAC:
+            return (f"echo {data} | base64 -d > {TOUCH_TMP}; "
+                    f"dd if={TOUCH_TMP} of={dev} bs={size} 2>/dev/null")
+        return f"echo {data} | base64 -d > {dev}"  # Windows: the whole struct in one write
+
+    return write
+
+
 def zoom_out(adb, times=3, W=1920, H=1080, spread=((460, 900), (1460, 1020))):
     """Two-finger pinch (fingers moving together) = the game's zoom-out, sent straight to the touch device.
     Stops at the game's limit, so extra pinches are harmless. Raw input_event structs are written in one shell
@@ -3493,18 +3652,20 @@ def zoom_out(adb, times=3, W=1920, H=1080, spread=((460, 900), (1460, 1020))):
         return False
     dev, mx, my = d
     ev = touch_ev(adb)
+    rotated = touch_panel_rotated(adb, W, H)
+    write = touch_writer(dev, ev)
     for _ in range(times):
         steps = []
         for i in range(9):
             f, b = i / 8, b""
             for slot, (x0, x1) in enumerate(spread):
+                rx, ry = touch_raw(x0 + (x1 - x0) * f, 480, mx, my, W, H, rotated)  # both fingers mid-screen
                 b += ev(3, 47, slot) + (ev(3, 57, 100 + slot) if i == 0 else b"")
-                b += ev(3, 53, int((x0 + (x1 - x0) * f) / W * mx)) + ev(3, 54, int(480 / H * my))
+                b += ev(3, 53, rx) + ev(3, 54, ry)
             b += (ev(1, 330, 1) if i == 0 else b"") + ev(0, 0, 0)  # BTN_TOUCH down with the first frame
             steps.append(b)
         steps.append(ev(3, 47, 0) + ev(3, 57, -1) + ev(3, 47, 1) + ev(3, 57, -1) + ev(1, 330, 0) + ev(0, 0, 0))
-        adb.shell("; sleep 0.02; ".join(f"echo {base64.b64encode(s).decode()} | base64 -d > {dev}" for s in steps),
-                  timeout=30)
+        adb.shell("; sleep 0.02; ".join(write(s) for s in steps), timeout=30)
         time.sleep(0.3)
     return True
 
@@ -3519,16 +3680,29 @@ def fast_taps(adb, pts, W=1920, H=1080):
     dev, mx, my = d
     ev = touch_ev(adb)
     raw = lambda bs: "".join(f"\\{x:03o}" for x in bs)  # printf escapes: exactly 3 octal digits a byte
+    rotated = touch_panel_rotated(adb, W, H)  # BlueStacks Air's panel is rotated: without this every tap lands wrong
     up = raw(ev(3, 47, 0) + ev(3, 57, -1) + ev(1, 330, 0) + ev(0, 0, 0))
-    cmds = [f"printf '{raw(ev(3, 47, 0) + ev(3, 57, 200 + i % 100) + ev(3, 53, int(x / W * mx)) + ev(3, 54, int(y / H * my)) + ev(1, 330, 1) + ev(0, 0, 0))}' >&3; sleep 0.02; printf '{up}' >&3"
-            for i, (x, y) in enumerate(pts)]
+    cmds = []
+    for i, (x, y) in enumerate(pts):
+        rx, ry = touch_raw(x, y, mx, my, W, H, rotated)
+        down = ev(3, 47, 0) + ev(3, 57, 200 + i % 100) + ev(3, 53, rx) + ev(3, 54, ry) + ev(1, 330, 1) + ev(0, 0, 0)
+        cmds.append(f"printf '{raw(down)}' >&3; sleep 0.02; printf '{up}' >&3")
     for i in range(0, len(cmds), 30):
         adb.shell(f"exec 3> {dev}; " + "; ".join(cmds[i:i + 30]) + "; exec 3>&-", timeout=20)
     return True
 
 
 def battery():
-    """(percent, plugged_in) from Windows, or None on a PC without a battery."""
+    """(percent, plugged_in), or None on a machine without a battery the bot can read."""
+    if IS_MAC:
+        try:  # pmset works on MacBooks; a Mac mini/Studio reports no battery -> None
+            out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=10).stdout
+            m = re.search(r"(\d+)%", out)
+            if not m or "InternalBattery" not in out:
+                return None
+            return int(m.group(1)), "AC Power" in out
+        except Exception:
+            return None
 
     class SPS(ctypes.Structure):
         _fields_ = [("ac", ctypes.c_ubyte), ("flag", ctypes.c_ubyte), ("pct", ctypes.c_ubyte),
@@ -3608,7 +3782,7 @@ class DropLinePicker(tk.Toplevel):
                 self.cv.create_oval(x - r, y - r, x + r, y + r, outline="white", width=S(3), fill=col)
                 for dx, dy, c in ((2, 2, "black"), (0, 0, "white")):
                     self.cv.create_text(x + r + 6 + dx, y - r - 6 + dy, text=label, fill=c, anchor="w",
-                                        font=("Segoe UI", 12, "bold"))
+                                        font=(UI_FONT, 12, "bold"))
         self.info.config(text=f"Start: {tuple(a) if a else '-'}     End: {tuple(b) if b else '- (one spot only)'}")
 
     def click(self, e):
@@ -3823,10 +3997,10 @@ class PlannerTab(ttk.Frame):
     # plain tk widgets inside the lists: themed ttk ones made each redraw take seconds
     def _lbl(self, parent, text="", bold=False, muted=False, size=10, **kw):
         return tk.Label(parent, text=text, bg=kw.pop("bg", CARD), fg=MUTED if muted else TEXT, anchor="w",
-                        font=("Segoe UI", size, "bold" if bold else "normal"), justify="left", **kw)
+                        font=(UI_FONT, size, "bold" if bold else "normal"), justify="left", **kw)
 
     def _chip(self, parent, text, cmd):
-        c = tk.Label(parent, text=text, bg="#3a3a3a", fg=TEXT, font=("Segoe UI", 9, "bold"), padx=S(7), pady=S(3),
+        c = tk.Label(parent, text=text, bg="#3a3a3a", fg=TEXT, font=(UI_FONT, 9, "bold"), padx=S(7), pady=S(3),
                      cursor="hand2")
         c.bind("<Button-1>", lambda e: cmd())
         return c
@@ -3924,16 +4098,16 @@ class PlannerTab(ttk.Frame):
             cv.create_image(pad, pad, image=ic, anchor="nw")
         tx = pad + S(64)
         y = cv.bbox(cv.create_text(tx, pad, text=e["name"], anchor="nw", fill=TEXT,
-                                   font=("Segoe UI", 11, "bold"), width=right - tx))[3]
-        y = cv.bbox(cv.create_text(tx, y + S(2), text=have, anchor="nw", fill=MUTED, font=("Segoe UI", 9),
+                                   font=(UI_FONT, 11, "bold"), width=right - tx))[3]
+        y = cv.bbox(cv.create_text(tx, y + S(2), text=have, anchor="nw", fill=MUTED, font=(UI_FONT, 9),
                                    width=right - tx))[3]
         if mx:
             y = cv.bbox(cv.create_text(tx, y + S(2), text=f"max {mx} at this hall", anchor="nw", fill=MUTED,
-                                       font=("Segoe UI", 9)))[3]
+                                       font=(UI_FONT, 9)))[3]
         y = max(y, pad + S(56)) + S(8)
         info = {"frame": cv, "chips": [], "x": None, "name": e["name"].lower(), "cat": category_of(k.split(":", 1)[1])}
         if cur is None or mx is None or cur >= mx:
-            y = cv.bbox(cv.create_text(pad, y, anchor="nw", fill=MUTED, font=("Segoe UI", 9), text=(
+            y = cv.bbox(cv.create_text(pad, y, anchor="nw", fill=MUTED, font=(UI_FONT, 9), text=(
                 "✓ maxed for this hall" if cur is not None and mx and cur >= mx else "(level couldn't be read)")))[3]
             cv.configure(height=y + pad)
             return info
@@ -3942,7 +4116,7 @@ class PlannerTab(ttk.Frame):
         def chip(text, cmd, line):
             line = max(line, row[0])  # stay on the row an earlier chip wrapped to
             t = cv.create_text(x[0] + S(7), line + S(3), text=text, anchor="nw", fill=TEXT,
-                               font=("Segoe UI", 9, "bold"))
+                               font=(UI_FONT, 9, "bold"))
             x0, y0, x1, y1 = cv.bbox(t)
             if x1 + S(7) > right and x[0] > pad + S(60):  # no room left on this row: wrap under it
                 cv.move(t, pad - x[0], y1 - y0 + S(12))
@@ -3958,7 +4132,7 @@ class PlannerTab(ttk.Frame):
             return r, t
         line = y
         x[0] = cv.bbox(cv.create_text(pad, line + S(3), text="Up to:", anchor="nw", fill=MUTED,
-                                      font=("Segoe UI", 9)))[2] + S(6)
+                                      font=(UI_FONT, 9)))[2] + S(6)
         targets = list(range(cur + 1, mx + 1))
         many = len(targets) > 6  # heroes have dozens of levels: next few + max, plus a picker for any level
         if many:
@@ -3970,7 +4144,7 @@ class PlannerTab(ttk.Frame):
         y = cv.bbox("all")[3] + S(8)
         if many:
             x[0] = cv.bbox(cv.create_text(pad, y + S(3), text="or level", anchor="nw", fill=MUTED,
-                                          font=("Segoe UI", 9)))[2] + S(6)
+                                          font=(UI_FONT, 9)))[2] + S(6)
             sp = tk.Spinbox(cv, from_=cur + 1, to=mx, width=5, bg="#3a3a3a", fg=TEXT, buttonbackground=CARD,
                             relief="flat", insertbackground=TEXT)
             x[0] = cv.bbox(cv.create_window(x[0], y, window=sp, anchor="nw"))[2] + S(6)
@@ -4109,7 +4283,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         global UI_SCALE
-        UI_SCALE = self.winfo_fpixels("1i") / 96
+        # Windows scales fonts with the display; macOS Tk reports 72 dpi (would shrink the UI to 75%)
+        UI_SCALE = 1.0 if IS_MAC else self.winfo_fpixels("1i") / 96
         self.title("Loot Farmer")
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{min(S(1240), int(sw * .92))}x{min(S(800), int(sh * .85))}+{int(sw * .04)}+{int(sh * .03)}")
@@ -4135,7 +4310,9 @@ class App(tk.Tk):
             key, port = self.cfg["phone_view_key"], self.cfg["phone_view_port"]
             try:
                 self.phone = PhoneView(port, key)
-                exe = os.path.join(BASE_DIR, "cloudflared.exe")
+                exe = os.path.join(BASE_DIR, "cloudflared.exe" if IS_WIN else "cloudflared")
+                if not os.path.isfile(exe) and not IS_WIN:
+                    exe = shutil.which("cloudflared") or exe  # brew install cloudflared
                 if self.cfg["public_link_enabled"] and os.path.isfile(exe):
                     self.tunnel = Tunnel(exe, port, lambda url: self.ui(lambda: self._public_url(url)))
                 else:
@@ -4173,16 +4350,16 @@ class App(tk.Tk):
 
     def _styles(self):
         s = ttk.Style(self)
-        f = "Segoe UI Variable Display" if "Segoe UI Variable Display" in self.tk.call("font", "families") else "Segoe UI"
+        f = "Segoe UI Variable Display" if "Segoe UI Variable Display" in self.tk.call("font", "families") else UI_FONT
         s.configure("Title.TLabel", font=(f, 20, "bold"))
-        s.configure("Sub.TLabel", font=("Segoe UI", 10), foreground=MUTED)
-        s.configure("CardTitle.TLabel", font=("Segoe UI", 9, "bold"), foreground=MUTED)
+        s.configure("Sub.TLabel", font=(UI_FONT, 10), foreground=MUTED)
+        s.configure("CardTitle.TLabel", font=(UI_FONT, 9, "bold"), foreground=MUTED)
         s.configure("CardValue.TLabel", font=(f, 22, "bold"))
         s.configure("Big.TLabel", font=(f, 15, "bold"))
         s.configure("Res.TLabel", font=(f, 17, "bold"))
         s.configure("Muted.TLabel", foreground=MUTED)
-        s.configure("Pill.TLabel", font=("Segoe UI", 10, "bold"))
-        s.configure("Start.Accent.TButton", font=("Segoe UI", 11, "bold"), padding=S(22, 9))
+        s.configure("Pill.TLabel", font=(UI_FONT, 10, "bold"))
+        s.configure("Start.Accent.TButton", font=(UI_FONT, 11, "bold"), padding=S(22, 9))
         s.configure("Treeview", rowheight=S(30))
 
     def card(self, parent, title, **grid):
@@ -4195,7 +4372,7 @@ class App(tk.Tk):
     def text_widget(self, parent, height):
         t = tk.Text(parent, height=height, bg="#141414", fg=TEXT, insertbackground=TEXT, relief="flat",
                     font=("Cascadia Mono", 9) if "Cascadia Mono" in self.tk.call("font", "families")
-                    else ("Consolas", 9), padx=S(10), pady=S(8), wrap="word", borderwidth=0, highlightthickness=0)
+                    else (MONO_FONT, 9), padx=S(10), pady=S(8), wrap="word", borderwidth=0, highlightthickness=0)
         for lvl, col in LEVEL_COLORS.items():
             t.tag_configure(lvl, foreground=col)
         t.tag_configure("ts", foreground="#6b6b6b")
@@ -4212,7 +4389,7 @@ class App(tk.Tk):
         ttk.Label(left, text="Clash of Clans  ·  unattended resource farming", style="Sub.TLabel").pack(anchor="w")
         if self.phone:
             self.public_label = ttk.Label(left, text="🌍  Anywhere link: starting…" if self.tunnel else
-                                          "🌍  Anywhere link: add cloudflared.exe next to bot.py",
+                                          "🌍  Anywhere link: install cloudflared" if IS_MAC else "🌍  Anywhere link: add cloudflared.exe next to bot.py",
                                           style="Sub.TLabel", foreground=BLUE if self.tunnel else MUTED,
                                           cursor="hand2")
             self.public_label.pack(anchor="w")
@@ -4301,7 +4478,7 @@ class App(tk.Tk):
         self.preview = tk.Canvas(live, bg="#141414", highlightthickness=0, height=S(240))
         self.preview.pack(fill="both", expand=True)
         self.preview.create_text(10, 10, anchor="nw", text="The emulator screen appears here while farming.",
-                                 fill=MUTED, font=("Segoe UI", 10), tags="hint")
+                                 fill=MUTED, font=(UI_FONT, 10), tags="hint")
         self._photo = None
 
         side = ttk.Frame(tab)
@@ -4483,7 +4660,7 @@ class App(tk.Tk):
         bar = ttk.Frame(tab)
         bar.pack(fill="x", pady=S(0, 10))
         ttk.Label(bar, text=f"Also saved to {LOG_FILE}", style="Muted.TLabel").pack(side="left")
-        ttk.Button(bar, text="Open log file", command=lambda: os.startfile(LOG_FILE)).pack(side="right")
+        ttk.Button(bar, text="Open log file", command=lambda: open_path(LOG_FILE)).pack(side="right")
         ttk.Button(bar, text="Clear", command=self._clear_log).pack(side="right", padx=S(8))
         self.full_log = self.text_widget(tab, 20)
         sb = ttk.Scrollbar(tab, command=self.full_log.yview)
@@ -4611,7 +4788,7 @@ class App(tk.Tk):
             if new != self.public_url:
                 self.log(f"Anywhere link ready: {new}", "ok")
                 self.bg(lambda: post_discord(self.cfg, f"🟢 **Loot Farmer v{APP_VERSION}** is running on "
-                                                       f"**{os.environ.get('COMPUTERNAME', 'a PC')}**\n{new}"))
+                                                       f"**{host_name()}**\n{new}"))
             self.public_url = new
             self.public_label.config(text="🌍  Anywhere link  (click to copy)", foreground=BLUE)
         else:
@@ -4679,7 +4856,7 @@ class App(tk.Tk):
         self.started_at = time.time()
         if self.public_url:  # the start-up post can be missed (PC asleep, network not up yet): send it again
             url = self.public_url
-            pc = os.environ.get("COMPUTERNAME", "a PC")
+            pc = host_name()
             self.bg(lambda: post_discord(self.cfg, f"▶️ Farming started on **{pc}**\n{url}"))
         for m, (btn, _) in self.mode_buttons().items():
             if m == mode:
@@ -4874,10 +5051,7 @@ class App(tk.Tk):
 
     def _restart_now(self):
         self._close()
-        exe = sys.executable
-        if os.name == "nt" and exe.lower().endswith("python.exe") and os.path.exists(exe[:-10] + "pythonw.exe"):
-            exe = exe[:-10] + "pythonw.exe"
-        subprocess.Popen([exe, os.path.abspath(__file__)], cwd=BASE_DIR, creationflags=0x00000008)
+        subprocess.Popen([python_gui_exe(), os.path.abspath(__file__)], cwd=BASE_DIR, **DETACHED)
 
     def send_report(self, reason, auto=False):
         """bot.log, the debug screenshots, the live screen and the non-secret settings to the Discord webhook.
@@ -4909,7 +5083,7 @@ class App(tk.Tk):
             secret = ("groq_api_key", "phone_view_key", "discord_webhook")
             files.append(("settings.json", json.dumps({k: v for k, v in self.cfg.items() if k not in secret},
                                                       indent=1).encode()))
-            text = (f"🐞 **Debug report** from **{os.environ.get('COMPUTERNAME', 'a PC')}** (v{APP_VERSION}) - "
+            text = (f"🐞 **Debug report** from **{host_name()}** (v{APP_VERSION}) - "
                     f"{reason}\nState: {self.state_label.cget('text')}")
             if post_discord(self.cfg, text, files):
                 self.log(f"Debug report sent to Discord ({len(files)} files).", "ok")
@@ -4923,10 +5097,7 @@ class App(tk.Tk):
             return
         self.log("Restarting…")
         self._close()
-        exe = sys.executable
-        if os.name == "nt" and exe.lower().endswith("python.exe") and os.path.exists(exe[:-10] + "pythonw.exe"):
-            exe = exe[:-10] + "pythonw.exe"  # no console window
-        subprocess.Popen([exe, os.path.abspath(__file__)], cwd=BASE_DIR, creationflags=0x00000008)  # detached
+        subprocess.Popen([python_gui_exe(), os.path.abspath(__file__)], cwd=BASE_DIR, **DETACHED)  # detached
 
     def _close(self):
         if self.bot:
@@ -5261,7 +5432,7 @@ def make_package():
                   auto_connect_target=DEFAULTS["auto_connect_target"], watchdog_enabled=False)
     out = os.path.join(BASE_DIR, "LootFarmer_share.zip")
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in ("bot.py", "setup.ps1", "Setup.bat", "README.txt"):
+        for f in ("bot.py", "setup.ps1", "Setup.bat", "setup_mac.sh", "README.txt"):
             z.write(os.path.join(BASE_DIR, f), f"LootFarmer/{f}")
         for folder in ("Tesseract-OCR", "platform-tools"):  # bundled tools: nothing to install
             for root, _, files in os.walk(os.path.join(BASE_DIR, folder)):
@@ -5278,7 +5449,8 @@ def make_package():
     print(f"Created {out}")
 
 
-PUBLISHED = ("bot.py", "setup.ps1", "Setup.bat", "README.txt", ".gitignore", ".gitattributes")
+PUBLISHED = ("bot.py", "setup.ps1", "Setup.bat", "setup_mac.sh", "README.txt", ".gitignore",
+             ".gitattributes")
 
 
 def published_files():
@@ -5388,7 +5560,7 @@ def make_update():
     their drop lines, settings and account setup; new settings get their defaults) and no bundled tools."""
     out = os.path.join(BASE_DIR, "LootFarmer_update.zip")
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in ("bot.py", "setup.ps1", "Setup.bat", "README.txt"):
+        for f in ("bot.py", "setup.ps1", "Setup.bat", "setup_mac.sh", "README.txt"):
             z.write(os.path.join(BASE_DIR, f), f"LootFarmer/{f}")
         for f in sorted(os.listdir(TEMPLATE_DIR)):
             if f.endswith(".png") and not f.startswith("old_"):

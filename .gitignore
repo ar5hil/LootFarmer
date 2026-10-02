@@ -3,7 +3,7 @@ config.json
 bot.log
 cloudflared.log
 tunnel.json
-debug_wall.png
+debug_*.png
 # build outputs and big binaries
 *.zip
 __pycache__/
@@ -17,3 +17,4 @@ backups/
 config.json.*
 wiki_build.log
 build_wiki_data.py
+Loot Farmer.command
