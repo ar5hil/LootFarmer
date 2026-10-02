@@ -693,9 +693,11 @@ def ocr_number(frame, bbox, pad=4, min_digits=1, thorough=True):
 
     # psm 8 = "a single word" is the right model for a crop that is nothing but a number, and it is the
     # reliable one across tesseract builds (psm 7/6 misread 3 as 5 with tesseract 5.5 on macOS).
-    v = read(otsu, 8)
+    v = read(otsu, 8) or read(cv2.bitwise_not(otsu), 8)
+    if v is None:  # last resort (one extra pass, e.g. the battle damage % when the digit templates miss):
+        v = read(otsu, 7)  # the line model reads some stylised in-game text better
     if v is not None or not thorough:
-        return v if v is not None else read(cv2.bitwise_not(otsu), 8)
+        return v
     variants = [otsu, cv2.bitwise_not(otsu),
                 cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5),
                 cv2.dilate(otsu, np.ones((2, 2), np.uint8))]
