@@ -70,6 +70,30 @@ STEP 5 - Start farming
 6. Press "Start farming".
 
 
+WALLS ONLY MODE
+---------------
+Press "🧱  Walls only" instead of "Start farming" when you want every coin spent on walls
+first. All session long it repeats this:
+
+  1. Empty the storages into walls - gold and elixir go on the next wall upgrade (the
+     largest batch you can afford at once), again and again, until the next upgrade is
+     out of reach.
+  2. Only then go looting, attacking and skipping bases by the same loot rules as usual.
+  3. Come home with more loot, spend it on walls again, then loot again.
+
+Walls never need a builder in Clash of Clans, so busy builders don't stop it. It ignores
+the "Spend when storage >=" setting (that one is for normal farming, where walls use only
+the storage above the threshold). If a purchase fails for a currency it waits 5 minutes
+before trying that currency again, so a bad reading can't loop. When every wall is max
+for your Town Hall it stops and says so.
+
+The dashboard's Walls card wants one planner scan per account (Upgrade planner tab >
+Scan) to show the "X to go" estimate - without a scan the bot still spends every coin on
+walls, it just can't display what's left.
+
+If you want builders and the lab to keep upgrading as well, use "Start farming" with
+"Buy walls when storage is full" instead - that mode keeps the threshold.
+
 PHONE VIEW
 ----------
 Click "Anywhere link" under the title to copy it, then open it on your phone.
@@ -128,7 +152,8 @@ M4 - Start farming
 3. The top right should say "Connected". If it says "Offline", click the refresh
    (circle arrow) button next to it.
 4. Setup tab > "Run setup check" - the log should say everything required is set up.
-5. Settings tab - choose what you want, "Save settings", then "Start farming".
+5. Settings tab - choose what you want, "Save settings", then "Start farming" (or press
+   "🧱  Walls only" to spend everything on walls first - see WALLS ONLY MODE above).
 
 
 M5 - One-time calibration (do this once)

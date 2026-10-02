@@ -313,7 +313,8 @@ SETTINGS = [
         ("deploy_tap_delay", "Pause between taps (s)", float),
     ]),
     ("Upgrades", "From the home screen: free builders and the lab take the most expensive thing you can "
-                 "afford; walls use storage above the threshold.", [
+                 "afford; walls use storage above the threshold. The 'Walls only' button ignores the threshold: "
+                 "it spends every coin on walls first and only loots when the next upgrade is out of reach.", [
         ("builder_upgrades_enabled", "Builders: upgrade buildings / heroes", bool),
         ("skip_town_hall", "Never upgrade the Town Hall (don't rush)", bool),
         ("lab_upgrades_enabled", "Lab: research troops / spells", bool),
@@ -1327,6 +1328,7 @@ class Bot:
         self.hits = {}
         self._last_shot = self._last_preview = 0.0
         self._bank_backoff = {}
+        self._scan_retry = {}  # kind -> don't try the planner scan again before this time (see maybe_rescan)
         self._upgrade_backoff = {}
         self._busy_until = {}  # kind -> time: 'only the goblin is free' counts as busy for account rotation
         self._bb_next = {}     # account -> time of its next Builder Base visit
@@ -1545,7 +1547,10 @@ class Bot:
         storage = self.track_loot(frame, self.read_storage(frame))
         if self.mode == "loot":  # Loot only: no upgrades, walls or account switching - just attack
             return self.attack_now()
-        if self.mode == "walls":  # Walls only: farm, and every time the next wall level is affordable, buy it
+        if self.mode == "walls":
+            # Walls only: spend everything the storages hold on walls and loot only when the next upgrade is out
+            # of reach. buy_wall trims the Upgrade More selection to what is affordable, so one pass can empty the
+            # storages; the loop comes straight back here after every attack (and after every purchase).
             if self.maybe_rescan("builder", hours=1):  # keeps the dashboard's wall count current
                 return
             price = self.wall_price()
@@ -1553,8 +1558,16 @@ class Bot:
                 self.log("Every wall is max for this Town Hall - nothing left to buy. Stopping.", "ok")
                 self.stop_evt.set()
                 raise Abort()
-            if self.spend_bank(storage, price):
+            # No wall rows in the planner scan (first run, or the game's data export didn't come through)? Try
+            # anyway: buy_wall reads the real price off the Upgrade More bar and only buys what we can afford.
+            if self.spend_bank(storage, 0 if price is None else price):
                 return
+            if time.time() - getattr(self, "_wall_note_t", 0) > 60:
+                self._wall_note_t = time.time()
+                have = "  ".join(f"{k} {v:,}" if v is not None else f"{k} ?" for k, v in
+                                 (("gold", storage.get("gold")), ("elixir", storage.get("elixir"))))
+                self.log(f"Walls: next upgrade costs {price:,} - {have} left, going looting." if price else
+                         f"Walls: {have} left, nothing affordable - going looting.")
             return self.attack_now()
         for kind in ("builder", "lab"):
             if self.cfg[f"{kind}_upgrades_enabled"] and time.time() >= self._upgrade_backoff.get(kind, 0):
@@ -1902,20 +1915,18 @@ class Bot:
         return wiki_data()["home:wall"]["levels"][min(lv for lv in counts if lv < mx)]["cost"]
 
     def spend_bank(self, storage, threshold=None):
-        thr = threshold or self.cfg["bank_spend_threshold"]
+        """Buy walls with what the storages hold. `threshold` is the price of the next wall upgrade (0 = try
+        whatever we have: buy_wall reads the real price in the game and only buys what is affordable). Without a
+        threshold the Settings value is used, which is what the farm mode's 'buy walls when storage is full'
+        does. Returns True only when a wall was really bought, so the caller can go looting when it wasn't.
+        Walls do not use a builder in Clash of Clans, so a busy builder list is never a reason to skip them."""
+        thr = self.cfg["bank_spend_threshold"] if threshold is None else threshold
         if not any((storage.get(c) or 0) >= thr for c in ("gold", "elixir")):
-            return False
-        if time.time() < self._bank_backoff.get("builder", 0):
-            return False
-        if self.free_slots(self.shot(), "builder") == 0:  # walls are instant but still need a free builder
-            self._bank_backoff["builder"] = time.time() + 600
-            self.log("Walls: every builder is busy (the game needs a free one even for walls) - farming on, "
-                     "checking again in 10 min.")
             return False
         did = False
         for cur in ("gold", "elixir"):
             val = storage.get(cur)
-            if val is None or val < (threshold or self.cfg["bank_spend_threshold"]):
+            if val is None or val < thr:
                 continue
             if time.time() < self._bank_backoff.get(cur, 0):
                 continue
@@ -1924,9 +1935,9 @@ class Bot:
             if again != val:  # a one-off misread (e.g. 1.7M read as 17M) must never trigger a purchase
                 self.log(f"{cur.title()} read {val:,} then {again} - not sure, skipping this time.", "warn")
                 continue
-            did = True
             if self.buy_wall(cur, val):
                 self.walls_progress(getattr(self, "_wall_paid", 0))
+                did = True
             else:
                 self._bank_backoff[cur] = time.time() + 300
                 self.log(f"Couldn't buy a {cur} wall - trying again in 5 min.", "warn")
@@ -2813,6 +2824,8 @@ class Bot:
         """Builders all busy: read the list anyway if this account's planner scan is missing or old. True if it did."""
         if kind.endswith("lab") or not self._last_name or self._last_name == "?":
             return False
+        if time.time() < self._scan_retry.get(kind, 0):  # a list that wouldn't read: don't hammer it
+            return False
         base = "builder" if kind.startswith("bb_") else "home"
         sd = ((self.cfg.get("scans") or {}).get(self._last_name) or {}).get(base) or {}
         try:
@@ -2834,7 +2847,13 @@ class Bot:
             self.resolve_levels(kind, base)
             self.log(f"Upgrade planner: refreshed {self._last_name}'s {'Builder Base' if base == 'builder' else 'home'}"
                      f" scan ({len(seen)} upgrades left).")
-        return True
+            self._scan_retry.pop(kind, None)
+            return True
+        # Nothing readable this time. Returning True here would leave the scan stale, so the next loop pass would
+        # open the list again - and walls mode would never get round to spending or looting.
+        self._scan_retry[kind] = time.time() + 900
+        self.log("Upgrade planner: the list didn't read this time - carrying on, trying again in 15 min.", "warn")
+        return False
 
     def scan_now(self):
         """Planner's 'Scan': open this account's builder list (home or Builder Base, whichever is showing), read it."""
