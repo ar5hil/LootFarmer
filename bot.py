@@ -72,71 +72,17 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 17  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
-UPDATE_REPO = "Geo-Col/LootFarmer"
+APP_VERSION = 19  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
+# Shipped inside the bot folder so nothing needs installing (used when the configured path doesn't exist)
+BUNDLED = {"adb_path": os.path.join(BASE_DIR, "platform-tools", "adb.exe"),
+           "tesseract_path": os.path.join(BASE_DIR, "Tesseract-OCR", "tesseract.exe")}
 os.makedirs(TEMPLATE_DIR, exist_ok=True)
-
-# ---------------------------------------------------------------------------
-# Platform: Windows = BlueStacks 5, macOS = BlueStacks Air (Apple silicon)
-# ---------------------------------------------------------------------------
-IS_WIN = os.name == "nt"
-IS_MAC = sys.platform == "darwin"
-BS_APP_MAC = "/Applications/BlueStacks.app"
-BS_CONF_MAC = "/Users/Shared/Library/Application Support/BlueStacks/bluestacks.conf"
-
-
-def _first_path(*paths):
-    """The first of these that exists on this machine, or ""."""
-    for p in paths:
-        if p and os.path.exists(p):
-            return p
-    return ""
-
-
-if IS_MAC:
-    # BlueStacks Air ships its own adb (hd-adb): using it keeps client and server in step. Homebrew
-    # (brew install android-platform-tools) or Google's platform-tools work just as well.
-    BUNDLED = {"adb_path": _first_path(os.path.join(BS_APP_MAC, "Contents", "MacOS", "hd-adb"),
-                                       shutil.which("adb"), "/opt/homebrew/bin/adb", "/usr/local/bin/adb"),
-               "tesseract_path": _first_path(shutil.which("tesseract"), "/opt/homebrew/bin/tesseract",
-                                             "/usr/local/bin/tesseract")}
-else:
-    # Shipped inside the bot folder so nothing needs installing (used when the configured path doesn't exist)
-    BUNDLED = {"adb_path": os.path.join(BASE_DIR, "platform-tools", "adb.exe"),
-               "tesseract_path": os.path.join(BASE_DIR, "Tesseract-OCR", "tesseract.exe")}
-NO_WINDOW = 0x08000000 if IS_WIN else 0  # no console flash per adb call
-DETACHED = {"creationflags": 0x00000008} if IS_WIN else {"start_new_session": True}  # outlive this process
-# cloudflared also gets its own process group on Windows (Ctrl+C in the parent's console must not reach it)
-DETACHED_TUNNEL = ({"creationflags": 0x00000008 | 0x00000200} if IS_WIN else {"start_new_session": True})
-UI_FONT = "Segoe UI" if IS_WIN else "Helvetica Neue"  # macOS has no Segoe UI; Tk substitutes an ugly one
-MONO_FONT = "Consolas" if IS_WIN else "Menlo"
-
-
-def open_path(path):
-    """Open a file or folder in the desktop's default program."""
-    if IS_WIN:
-        os.startfile(path)
-    else:
-        subprocess.run(["open" if IS_MAC else "xdg-open", path], check=False)
-
-
-def host_name():
-    """This machine's name (COMPUTERNAME exists only on Windows)."""
-    uname = getattr(os, "uname", None)  # socket is not imported any more
-    return os.environ.get("COMPUTERNAME") or (uname().nodename.split(".")[0] if uname else "") or "a PC"
-
-
-def python_gui_exe():
-    """sys.executable, but pythonw.exe on Windows so restarting the app doesn't flash a console window."""
-    exe = sys.executable
-    if IS_WIN and exe.lower().endswith("python.exe") and os.path.exists(exe[:-10] + "pythonw.exe"):
-        exe = exe[:-10] + "pythonw.exe"
-    return exe
-
+NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # no console flash per adb call
 
 BUTTONS = [
     ("attack_button", "Attack! (home screen)"),
@@ -211,8 +157,7 @@ STATE_LABELS = {
 }
 
 DEFAULTS = {
-    "adb_path": (r"C:\Program Files\platform-tools\adb.exe" if IS_WIN
-                 else (BUNDLED["adb_path"] or "/opt/homebrew/bin/adb")),
+    "adb_path": r"C:\Program Files\platform-tools\adb.exe",
     "device": "",
     "auto_connect_target": "127.0.0.1:5555",
     "match_confidence": 0.7,
@@ -239,8 +184,7 @@ DEFAULTS = {
     "stop_when_all_busy": True,
     "accounts": "",
     "hold_ms_per_troop": 120,
-    "deploy_select_delay": 0.15,
-    "deploy_tap_delay": 0.08,
+    "deploy_speed": "Fastest",  # troop/spell placing: see DEPLOY_SPEEDS
     "matchmaking_settle_delay": 2.0,
     "return_home_delay": 3.0,
     "bank_spend_enabled": False,
@@ -254,7 +198,6 @@ DEFAULTS = {
     "bb_lab_upgrades": True,
     "bb_bonus_days": {},  # account -> date its daily Star Bonus was collected (no more attacks that day)
     "bank_spend_threshold": 15000000,
-    "wall_reserve": 3000000,  # never spend the last of this much gold/elixir on walls: below it, go looting
     "bank_scroll_duration_ms": 600,
     "bank_scroll_delay": 0.6,
     "bank_post_spend_delay": 1.0,
@@ -269,8 +212,7 @@ DEFAULTS = {
     "game_launch_wait": 25,
     "emulator_boot_wait": 40,
     "adb_ready_timeout": 90,
-    "tesseract_path": (r"C:\Program Files\Tesseract-OCR\tesseract.exe" if IS_WIN
-                       else (BUNDLED["tesseract_path"] or "/opt/homebrew/bin/tesseract")),
+    "tesseract_path": r"C:\Program Files\Tesseract-OCR\tesseract.exe",
     "ocr_region_padding_px": 4,
     "ocr_min_digits": 3,
     "groq_api_key": "",
@@ -287,6 +229,9 @@ DEFAULTS = {
     "fixed_points": {},
 }
 
+# Troop / spell placing speed: (pause between taps, pause after picking a card) in seconds. 'Fastest' = the army
+# down in ~1 s; slower ones help a slow PC / emulator that drops taps.
+DEPLOY_SPEEDS = {"Fastest": (0.0, 0.1), "Fast": (0.05, 0.15), "Normal": (0.12, 0.25), "Slow": (0.25, 0.4)}
 # (group, blurb, [(key, label, type)]) - type: bool/int/float/str/"secret", or a tuple of choices (dropdown)
 SETTINGS = [
     ("Loot", "Which bases are worth attacking.", [
@@ -300,6 +245,7 @@ SETTINGS = [
     ]),
     ("Battle", "Deploying and surrendering.", [
         ("deploy_spells", "Also drop spells at the drop point", bool),
+        ("deploy_speed", "Troop & spell placing speed", tuple(DEPLOY_SPEEDS)),
         ("deploy_pan", "Camera corner before deploying", ("top-left", "top-right", "bottom-left", "bottom-right", "off")),
         ("hero_abilities", "Use hero abilities", bool),
         ("hero_ability_delay", "Use abilities this long after deploying (s)", float),
@@ -310,18 +256,14 @@ SETTINGS = [
         ("battle_max_wait", "Surrender after (s) regardless", float),
         ("timer_poll_interval", "Damage check every (s)", float),
         ("hold_ms_per_troop", "Hold time per troop (ms)", int),
-        ("deploy_select_delay", "Pause after selecting unit (s)", float),
-        ("deploy_tap_delay", "Pause between taps (s)", float),
     ]),
     ("Upgrades", "From the home screen: free builders and the lab take the most expensive thing you can "
-                 "afford; walls use storage above the threshold. The 'Walls only' button ignores that threshold: "
-                 "it spends on walls until only the reserve is left, then starts looting.", [
+                 "afford; walls use storage above the threshold.", [
         ("builder_upgrades_enabled", "Builders: upgrade buildings / heroes", bool),
         ("skip_town_hall", "Never upgrade the Town Hall (don't rush)", bool),
         ("lab_upgrades_enabled", "Lab: research troops / spells", bool),
         ("bank_spend_enabled", "Buy walls when storage is full", bool),
         ("bank_spend_threshold", "Spend when storage >=", int),
-        ("wall_reserve", "Keep in storage for walls", int),
         ("bank_scroll_duration_ms", "List swipe duration (ms)", int),
         ("bank_scroll_delay", "Pause after swipe (s)", float),
         ("bank_post_spend_delay", "Pause after purchase (s)", float),
@@ -375,7 +317,7 @@ SETTINGS = [
 RUNTIME_KEYS = ("scans", "plans", "account_tags", "_last_account_idx", "loot_rate", "line_view")  # saved by the bot, not settings
 # Rarely-touched tuning: shown under 'Show advanced settings'
 ADVANCED = {"loot_settle_delay", "loot_recheck_delay", "loot_max_plausible", "hold_deploy", "damage_confirm_count",
-            "timer_poll_interval", "hold_ms_per_troop", "deploy_select_delay", "deploy_tap_delay",
+            "timer_poll_interval", "hold_ms_per_troop",
             "bank_scroll_duration_ms", "bank_scroll_delay", "bank_post_spend_delay", "gfx_profile",
             "emulator_launch_args", "coc_package_name", "coc_activity_name", "watchdog_attack_timeout",
             "game_launch_wait", "emulator_boot_wait", "adb_ready_timeout", "match_confidence",
@@ -409,8 +351,8 @@ def load_config():
             cfg[k] = path
     cfg["bb_bonus_days"] = dict(cfg.get("bb_bonus_days") or {})
     cfg["discord_webhook"] = cfg.get("discord_webhook") or DEFAULTS["discord_webhook"]  # blank saved = the built-in
-    player = r"C:\Program Files\BlueStacks_nxt\HD-Player.exe" if IS_WIN else BS_APP_MAC
-    if not os.path.exists(cfg.get("emulator_exe_path") or "") and os.path.exists(player):
+    player = r"C:\Program Files\BlueStacks_nxt\HD-Player.exe"
+    if not os.path.isfile(cfg.get("emulator_exe_path") or "") and os.path.isfile(player):
         cfg["emulator_exe_path"] = player  # so crash recovery can restart BlueStacks
     return cfg, err
 
@@ -694,19 +636,13 @@ def ocr_number(frame, bbox, pad=4, min_digits=1, thorough=True):
         d = re.sub(r"\D", "", txt)
         return int(d) if len(d) >= min_digits else None
 
-    # psm 8 = "a single word" is the right model for a crop that is nothing but a number, and it is the
-    # reliable one across tesseract builds (psm 7/6 misread 3 as 5 with tesseract 5.5 on macOS).
-    v = read(otsu, 8) or read(cv2.bitwise_not(otsu), 8)
-    if v is None:  # last resort (one extra pass, e.g. the battle damage % when the digit templates miss):
-        v = read(otsu, 7)  # the line model reads some stylised in-game text better
+    v = read(otsu, 7)
     if v is not None or not thorough:
-        return v
+        return v if v is not None else read(cv2.bitwise_not(otsu), 7)
     variants = [otsu, cv2.bitwise_not(otsu),
                 cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5),
                 cv2.dilate(otsu, np.ones((2, 2), np.uint8))]
-    results = [r for img in variants if (r := read(img, 8)) is not None]
-    if not results:  # unusual crop: fall back to the line / block models
-        results = [r for img in variants for psm in (7, 6) if (r := read(img, psm)) is not None]
+    results = [r for img in variants for psm in (7, 8, 6) if (r := read(img, psm)) is not None]
     if not results:
         return None
     counts = {r: results.count(r) for r in results}
@@ -868,14 +804,6 @@ TOP_BAR = {"lab": ((662, 61), (680, 30, 820, 95), (600, 20, 680, 105)),
            "bb_builder": ((1040, 60), (1080, 30, 1185, 95), (990, 20, 1075, 105))}
 KIND_NAMES = {"builder": "Builder", "lab": "Lab", "bb_builder": "Builder Base builder", "bb_lab": "Star Lab"}
 BB_STARS = (95, 866, 200, 910)  # the 'x/y' daily star counter on the Builder Base Attack button
-
-
-def wall_reserve_of(cfg):
-    """Gold/elixir kept back from wall upgrades (never spent on walls). 0 if unset or garbled."""
-    try:
-        return max(0, int(cfg.get("wall_reserve") or 0))
-    except (TypeError, ValueError):
-        return 0
 
 
 def top_bar(frame, kind):
@@ -1194,14 +1122,17 @@ def walls_left(sd):
 
 
 def read_clipboard():
-    """Clipboard text ('' if none). BlueStacks copies Android's clipboard to the desktop's clipboard, so the
-    game's exported base data can be read straight from it: Get-Clipboard on Windows, pbpaste on macOS."""
-    cmd = (["pbpaste"] if IS_MAC else
-           ["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"])
+    """Read the host clipboard where BlueStacks syncs the Android data export."""
+    if sys.platform == "darwin":
+        cmd = ["/usr/bin/pbpaste"]
+    elif os.name == "nt":
+        cmd = ["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"]
+    else:
+        return ""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=15,
-                              creationflags=NO_WINDOW).stdout or ""
-    except Exception:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=15, creationflags=NO_WINDOW).stdout or ""
+    except Exception as e:
+        log_file.info(f"Host clipboard read failed: {e}")
         return ""
 
 
@@ -1221,6 +1152,19 @@ def settings_drag_start(f):
             start = None
     low = [y for y in runs if y >= 300 * k]  # room to drag at least ~280px up
     return max(low) if low else None
+
+
+def settings_name(frame):
+    """Player name beside the avatar in the Settings window (white on blue), or None."""
+    if not HAVE_TESS:
+        return None
+    k = frame.shape[1] / 1920
+    g = cv2.cvtColor(frame[int(188 * k):int(228 * k), int(860 * k):int(1180 * k)], cv2.COLOR_BGR2GRAY)
+    try:  # plain greyscale reads this chunky font best (binarising it made 'GeoCol2' into 'GeaCol2d')
+        words = pytesseract.image_to_string(cv2.resize(g, None, fx=3, fy=3), config="--psm 7", timeout=5).split()
+    except Exception:
+        return None
+    return words[0] if words and len(words[0]) >= 2 else None
 
 
 def export_items(data):
@@ -1338,8 +1282,8 @@ class Bot:
         self.hits = {}
         self._last_shot = self._last_preview = 0.0
         self._bank_backoff = {}
-        self._scan_retry = {}  # kind -> don't try the planner scan again before this time (see maybe_rescan)
         self._upgrade_backoff = {}
+        self._scan_retry = {}  # kind -> retry time after an unreadable export and builder-list fallback
         self._busy_until = {}  # kind -> time: 'only the goblin is free' counts as busy for account rotation
         self._bb_next = {}     # account -> time of its next Builder Base visit
         self._acc_idx = -1
@@ -1437,12 +1381,6 @@ class Bot:
                     if state is None:
                         unknown_since = unknown_since or time.time()
                         stuck = time.time() - unknown_since
-                        if time.time() - getattr(self, "_unknown_saved", 0) > 60:
-                            self._unknown_saved = time.time()  # keep the screen we can't read (once a minute)
-                            try:
-                                cv2.imwrite(os.path.join(BASE_DIR, "debug_unknown.png"), frame)
-                            except Exception as e:
-                                log_file.info(f"debug_unknown.png: {e}")
                         # the Supercell logo / loading clouds after a (re)start aren't 'stuck': a slow PC can take
                         # minutes there, and relaunching mid-load would just loop
                         loading = time.time() - getattr(self, "_launched_at", 0) < 180
@@ -1563,10 +1501,7 @@ class Bot:
         storage = self.track_loot(frame, self.read_storage(frame))
         if self.mode == "loot":  # Loot only: no upgrades, walls or account switching - just attack
             return self.attack_now()
-        if self.mode == "walls":
-            # Walls only: spend everything the storages hold on walls and loot only when the next upgrade is out
-            # of reach. buy_wall trims the Upgrade More selection to what is affordable, so one pass can empty the
-            # storages; the loop comes straight back here after every attack (and after every purchase).
+        if self.mode == "walls":  # Walls only: farm, and every time the next wall level is affordable, buy it
             if self.maybe_rescan("builder", hours=1):  # keeps the dashboard's wall count current
                 return
             price = self.wall_price()
@@ -1574,18 +1509,8 @@ class Bot:
                 self.log("Every wall is max for this Town Hall - nothing left to buy. Stopping.", "ok")
                 self.stop_evt.set()
                 raise Abort()
-            # No wall rows in the planner scan (first run, or the game's data export didn't come through)? Try
-            # anyway: buy_wall reads the real price off the Upgrade More bar and only buys what we can afford.
-            # The reserve is kept back, so walls can never leave the bot too poor to find and fight a battle.
-            reserve = wall_reserve_of(self.cfg)
-            if self.spend_bank(storage, reserve + (price or 0)):
+            if self.spend_bank(storage, price):
                 return
-            if time.time() - getattr(self, "_wall_note_t", 0) > 60:
-                self._wall_note_t = time.time()
-                have = "  ".join(f"{k} {v:,}" if v is not None else f"{k} ?" for k, v in
-                                 (("gold", storage.get("gold")), ("elixir", storage.get("elixir"))))
-                self.log(f"Walls: {have} - keeping {reserve:,} back, going looting."
-                         + (f" Next upgrade: {price:,}." if price else ""))
             return self.attack_now()
         for kind in ("builder", "lab"):
             if self.cfg[f"{kind}_upgrades_enabled"] and time.time() >= self._upgrade_backoff.get(kind, 0):
@@ -1821,13 +1746,67 @@ class Bot:
             if fp.get("spell_point"):
                 cv2.line(dbg, tuple(fp["spell_point"]), tuple(fp.get("spell_line_end") or fp["spell_point"]),
                          (255, 80, 220), 6)
+            troop_n = sum(n or 0 for _, _, kind, n in bar if kind == "troop")
+            spell_n = sum(n or 0 for _, _, kind, n in bar if kind == "spell")
+            single_n = sum(1 for _, _, kind, _ in bar if kind == "single")
+            spell_note = "enabled" if c.get("deploy_spells") else "disabled"
+            cv2.putText(dbg, f"DEPLOY PLAN: {troop_n} troops | {single_n} heroes/siege | spells {spell_note}",
+                        (30, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             for x, y, kind, n in bar:
                 cv2.putText(dbg, f"{kind} {n or ''}", (x - 60, y - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.imwrite(os.path.join(BASE_DIR, "debug_deploy.png"), dbg)
+            path = os.path.join(BASE_DIR, "debug_deploy.png")
+            cv2.imwrite(path, dbg)
+            self.emit("frame", cv2.resize(dbg, (960, int(960 * dbg.shape[0] / dbg.shape[1])),
+                                           interpolation=cv2.INTER_AREA))
+            self.log(f"Deployment preview: {troop_n} troops, {single_n} heroes/siege; spells {spell_note}.")
         except Exception as e:
             log_file.info(f"debug_deploy.png: {e}")
         if not self.auto_deploy(a, b, bar):
-            self.log("Couldn't read the troop bar - no troops deployed (see debug_deploy.png).", "err")
+            self.log("No deployable troop, hero, siege, or enabled spell cards were detected (see debug_deploy.png).", "err")
+            return
+        after = self.shot()
+        after_bar = troop_bar(after)
+        to_check = [cd for cd in (bar or []) if cd[2] != "spell" or c.get("deploy_spells")]
+        confirmed, checked = self.deployment_check(to_check, after_bar)
+        after_dbg = after.copy()
+        cv2.line(after_dbg, tuple(a), tuple(b), (0, 210, 255), 6)
+        fp = c["fixed_points"]
+        if fp.get("spell_point"):
+            cv2.line(after_dbg, tuple(fp["spell_point"]), tuple(fp.get("spell_line_end") or fp["spell_point"]),
+                     (255, 80, 220), 6)
+        cv2.putText(after_dbg, f"POST-CHECK: {confirmed}/{checked} selected cards changed", (30, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+        for x, y, kind, n in after_bar:
+            cv2.putText(after_dbg, f"{kind} {n or ''}", (x - 60, y - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                        (255, 255, 255), 2)
+        cv2.imwrite(os.path.join(BASE_DIR, "debug_deploy_after.png"), after_dbg)
+        self.emit("frame", cv2.resize(after_dbg, (960, int(960 * after_dbg.shape[0] / after_dbg.shape[1])),
+                                       interpolation=cv2.INTER_AREA))
+        if checked:
+            self.log(f"Deployment check: {confirmed}/{checked} cards visibly changed; see debug_deploy_after.png."
+                     if confirmed == checked else
+                     f"Deployment check: {confirmed}/{checked} cards visibly changed; the rest are unconfirmed "
+                     "(see debug_deploy_after.png).", "ok" if confirmed == checked else "warn")
+        else:
+            self.log("Deployment check couldn't match the troop bar after placement (see debug_deploy_after.png).",
+                     "warn")
+
+    @staticmethod
+    def deployment_check(before, after):
+        """Best-effort card-state comparison; a changed count/state is evidence, not proof of troop survival."""
+        checked = confirmed = 0
+        for x, _, kind, count in before:
+            if kind not in ("troop", "spell", "single") or (kind != "single" and not count):
+                continue
+            match = min(after, key=lambda cd: abs(cd[0] - x), default=None)
+            if match is None or abs(match[0] - x) > 24:
+                continue
+            checked += 1
+            _, _, after_kind, after_count = match
+            if after_kind == "used" or (kind in ("troop", "spell") and after_count is not None
+                                         and count is not None and after_count < count):
+                confirmed += 1
+        return confirmed, checked
 
     def finish_battle(self):
         c = self.cfg
@@ -1839,7 +1818,7 @@ class Bot:
                 for xy in abilities:  # a dead hero's greyed card just ignores the tap
                     self.adb.tap(*xy)
                     self.sleep(0.25)
-                self.log(f"Used {len(abilities)} hero abilities.")
+                self.log(f"Sent ability taps to {len(abilities)} hero/siege cards; activation isn't visually confirmed.")
                 abilities = []
             frame = self.shot()
             if self.pick_reward(frame):
@@ -1933,35 +1912,31 @@ class Bot:
         return wiki_data()["home:wall"]["levels"][min(lv for lv in counts if lv < mx)]["cost"]
 
     def spend_bank(self, storage, threshold=None):
-        """Buy walls with what the storages hold. `threshold` is the price of the next wall upgrade (0 = try
-        whatever we have: buy_wall reads the real price in the game and only buys what is affordable). Without a
-        threshold the Settings value is used, which is what the farm mode's 'buy walls when storage is full'
-        does. `wall_reserve` is always kept back, so walls can never drain the bank to nothing - that is what
-        stops the bot from being unable to find or fight a battle. Returns True only when a wall was really
-        bought, so the caller can go looting when it wasn't. Walls do not use a builder in Clash of Clans, so a
-        busy builder list is never a reason to skip them."""
-        thr = self.cfg["bank_spend_threshold"] if threshold is None else threshold
-        reserve = wall_reserve_of(self.cfg)
+        thr = threshold or self.cfg["bank_spend_threshold"]
         if not any((storage.get(c) or 0) >= thr for c in ("gold", "elixir")):
+            return False
+        if time.time() < self._bank_backoff.get("builder", 0):
+            return False
+        if self.free_slots(self.shot(), "builder") == 0:  # walls are instant but still need a free builder
+            self._bank_backoff["builder"] = time.time() + 600
+            self.log("Walls: every builder is busy (the game needs a free one even for walls) - farming on, "
+                     "checking again in 10 min.")
             return False
         did = False
         for cur in ("gold", "elixir"):
             val = storage.get(cur)
-            if val is None or val < thr:
+            if val is None or val < (threshold or self.cfg["bank_spend_threshold"]):
                 continue
             if time.time() < self._bank_backoff.get(cur, 0):
-                continue
-            cap = val - reserve  # walls may only use what is above the reserve
-            if cap <= 0:
                 continue
             self.sleep(0.5)
             again = white_number(self.shot(), self.cfg["ocr_regions"].get(f"bank_{cur}_region") or (0, 0, 1, 1))
             if again != val:  # a one-off misread (e.g. 1.7M read as 17M) must never trigger a purchase
                 self.log(f"{cur.title()} read {val:,} then {again} - not sure, skipping this time.", "warn")
                 continue
-            if self.buy_wall(cur, val, cap):
+            did = True
+            if self.buy_wall(cur, val):
                 self.walls_progress(getattr(self, "_wall_paid", 0))
-                did = True
             else:
                 self._bank_backoff[cur] = time.time() + 300
                 self.log(f"Couldn't buy a {cur} wall - trying again in 5 min.", "warn")
@@ -2072,16 +2047,13 @@ class Bot:
                 return hit
             self.sleep(0.5)
 
-    def buy_wall(self, cur, balance=None, cap=None):
+    def buy_wall(self, cur, balance=None):
         """Builder list -> 'Wall' row (selects a wall) -> close list -> Upgrade More -> Upgrade in `cur`
-        -> Okay, but only if the dialog really says it upgrades Walls for `cur` (never gems).
-        `cap` (default: the whole balance) is what may be spent - the reserve is already taken off it; `balance`
-        stays the full storage reading so the 'did the balance drop' check below is measured against reality."""
+        -> Okay, but only if the dialog really says it upgrades Walls for `cur` (never gems)."""
         region = self.cfg["ocr_regions"].get(f"bank_{cur}_region")
         frame = self.shot()
         if balance is None and region:
             balance = white_number(frame, region)
-        cap = balance if cap is None else cap
         for attempt in range(3):  # a slid list can land the tap on the wrong building: just try again
             # always a fresh pick from the list: a bar left from the last purchase holds walls a level higher now
             more = self.select_wall()
@@ -2101,9 +2073,8 @@ class Bot:
             want = white_number(f, (bx - int(100 * k), more[1] - int(134 * k), bx + int(60 * k), more[1] - int(89 * k)))
             if not want:
                 return self.wall_fail("single wall: couldn't read its price (can't afford it?)", f)
-            if cap is not None and want > cap:
-                return self.wall_fail(f"single wall costs {want:,} but only {cap:,} is available above the "
-                                      f"reserve - not buying", f)
+            if balance is not None and want > balance:
+                return self.wall_fail(f"single wall costs {want:,} but storage is {balance:,} - not buying", f)
             self.log(f"Only one wall at this level - upgrading it on its own ({want:,} {cur}).")
             self.tap((bx, more[1] - int(40 * k)), 1.5)
         else:
@@ -2121,8 +2092,8 @@ class Bot:
             for _ in range(20):  # Upgrade More selects a whole row: drop walls (-1) until it's affordable
                 f = self.shot()
                 cost = self.bar_price(f, btn)
-                if cost is None or cap is None or cost <= cap:
-                    break  # drop walls off the selection until it fits above the reserve
+                if cost is None or balance is None or cost <= balance:
+                    break
                 k = f.shape[1] / 1920  # bar layout is fixed: Remove Wall, Add +10, Add +1, gold Upgrade, elixir Upgrade
                 self.tap((pair[0][0] - int(612 * k), pair[0][1] + int(12 * k)), 0.7)
             self.tap(btn, 1.2)
@@ -2144,9 +2115,8 @@ class Bot:
             if not ok or not want or shown != want:
                 return self.wall_fail(f"upgrade window didn't check out (price {shown} vs {want})", self.shot())
             price = want
-        if cap is not None and price > cap:
-            return self.wall_fail(f"costs {price:,} but only {cap:,} is available above the reserve - not buying",
-                                  frame)
+        if balance is not None and price > balance:
+            return self.wall_fail(f"costs {price:,} but storage is {balance:,} - not buying", frame)
         self.tap(ok, self.cfg["bank_post_spend_delay"])
         after = white_number(self.shot(), region) if region else None
         if balance is not None and after is not None and after > balance - price * 0.9:
@@ -2323,7 +2293,7 @@ class Bot:
     def bb_deploy(self, cards):
         a, b = (390, 380), (260, 600)  # left edge of the map: always outside the base, clear of the Boost buttons
         for k, (x, y, kind, n) in enumerate(cards):
-            self.tap((x, y), self.cfg["deploy_select_delay"])
+            self.tap((x, y), self.speed()[1])
             for i in range(n or 1):
                 self.adb.tap(*self.along(a, b, (k + i) % len(cards), len(cards)))
             self.sleep(0.2)
@@ -2781,7 +2751,7 @@ class Bot:
 
     def export_village(self):
         """Settings > More Settings > Data Export 'Copy': the game's own JSON with every level, both villages.
-        Read back from the Windows clipboard. None if any step didn't work (then the list is read instead)."""
+        Read back from the host clipboard (PowerShell on Windows, pbpaste on macOS). None if a step failed."""
         self.back_to_village()
         f = self.shot()
         k = f.shape[1] / 1920
@@ -2789,8 +2759,12 @@ class Bot:
         # strict matches only: a looser one takes look-alike green buttons (Credits, Change Name...)
         more = None
         for _ in range(6):
-            more = self.v.find(self.shot(), "more_settings_button", 0.9)
+            sf = self.shot()
+            more = self.v.find(sf, "more_settings_button", 0.9)
             if more:
+                n = settings_name(sf)  # the name, big and clean, beside the avatar - snapped to names already seen
+                near = n and difflib.get_close_matches(n.lower(), [x.lower() for x in self._names], 1, 0.75)
+                self._settings_name = next((x for x in self._names if near and x.lower() == near[0]), n)
                 break
             self.sleep(0.8)
         data = None
@@ -2809,15 +2783,19 @@ class Bot:
                 self.sleep(1.2)
             if hit:
                 self.tap((hit[0] + int(398 * k), hit[1]), 1.0)  # the green Copy button at the row's right
-                for _ in range(5):
+                for _ in range(10):  # BlueStacks Air may take longer to sync Android's clipboard to macOS
                     try:
-                        d = json.loads(read_clipboard())
+                        raw = read_clipboard()
+                        d = json.loads(raw)
                         if d.get("tag") and d.get("buildings") and abs(time.time() - d.get("timestamp", 0)) < 900:
                             data = d
                             break
-                    except (ValueError, AttributeError):
+                    except (ValueError, AttributeError, TypeError):
                         pass
                     self.sleep(1.0)
+                if data is None:
+                    self.log("Data Export Copy was tapped, but fresh export JSON wasn't available on the Mac clipboard; "
+                             "using the builder-list fallback.", "warn")
         self.back_to_village()
         return data
 
@@ -2830,9 +2808,10 @@ class Bot:
                      "instead.", "warn")
             return False
         tags = self.cfg.setdefault("account_tags", {})
-        acc = tags.get(data["tag"]) or (self._last_name if self._last_name not in (None, "?") else None)
-        if not acc:
-            return False
+        # 1) a tag seen before  2) the top-left name  3) the Settings window's name  4) the tag itself - a scan
+        # never fails just because a name couldn't be read (a fancy name / font / layout on another PC)
+        acc = (tags.get(data["tag"]) or (self._last_name if self._last_name not in (None, "?") else None)
+               or getattr(self, "_settings_name", None) or data["tag"])
         tags[data["tag"]] = self._last_name = acc
         scans = self.cfg.setdefault("scans", {}).setdefault(acc, {})
         for base, items in export_items(data).items():
@@ -2853,8 +2832,8 @@ class Bot:
         """Builders all busy: read the list anyway if this account's planner scan is missing or old. True if it did."""
         if kind.endswith("lab") or not self._last_name or self._last_name == "?":
             return False
-        if time.time() < self._scan_retry.get(kind, 0):  # a list that wouldn't read: don't hammer it
-            return False
+        if time.time() < self._scan_retry.get(kind, 0):
+            return False  # don't keep reopening More Settings if both export and the list reader fail
         base = "builder" if kind.startswith("bb_") else "home"
         sd = ((self.cfg.get("scans") or {}).get(self._last_name) or {}).get(base) or {}
         try:
@@ -2864,6 +2843,7 @@ class Bot:
         if age < hours * 3600:
             return False
         if self.scan_export():
+            self._scan_retry.pop(kind, None)
             return True
         icon = top_bar(self.shot(), kind)[0]
         self.tap(icon, 1.3)
@@ -2872,16 +2852,15 @@ class Bot:
         self.tap(icon, 1.0)
         self.back_to_village(icon)
         if seen:
+            self._scan_retry.pop(kind, None)
             self.record_scan(base, seen)
             self.resolve_levels(kind, base)
             self.log(f"Upgrade planner: refreshed {self._last_name}'s {'Builder Base' if base == 'builder' else 'home'}"
-                     f" scan ({len(seen)} upgrades left).")
-            self._scan_retry.pop(kind, None)
+                     f" scan from the builder list ({len(seen)} upgrades left).")
             return True
-        # Nothing readable this time. Returning True here would leave the scan stale, so the next loop pass would
-        # open the list again - and walls mode would never get round to spending or looting.
         self._scan_retry[kind] = time.time() + 900
-        self.log("Upgrade planner: the list didn't read this time - carrying on, trying again in 15 min.", "warn")
+        self.log("Upgrade planner: export failed and the builder-list fallback was unreadable; keeping the prior "
+                 "scan and retrying in 15 min.", "warn")
         return False
 
     def scan_now(self):
@@ -2900,7 +2879,8 @@ class Bot:
         if self.scan_export():  # exact levels of both villages, straight from the game
             return self._last_name, kind
         if not self._last_name or self._last_name == "?":
-            raise RuntimeError("couldn't read the account name at the top-left - close any popup and try again")
+            raise RuntimeError("the game's data export didn't come through (Settings > More Settings > Data Export) "
+                               "and the account name couldn't be read - close any popup and try again")
         icon = top_bar(f, kind)[0]
         if not panel_box(f):
             self.tap(icon, 1.3)
@@ -3047,9 +3027,14 @@ class Bot:
         f = k / (n - 1) if n > 1 else 0.5
         return int(a[0] + (b[0] - a[0]) * f), int(a[1] + (b[1] - a[1]) * f)
 
+    def speed(self):
+        """(pause between taps, pause after picking a card) for the chosen placing speed."""
+        return DEPLOY_SPEEDS.get(self.cfg.get("deploy_speed"), DEPLOY_SPEEDS["Fastest"])
+
     def drop(self, a, b, n, card):
         """Deploy n of the selected unit as taps spread evenly along a->b. Never drags: a moving touch scrolls the
-        view instead of placing troops. With a single spot (a == b) and hold-to-deploy, a still long-press is used."""
+        view instead of placing troops. Raw touch-device events can be accepted by the shell without the game
+        receiving them, so use Android's input command. With a single spot and hold-to-deploy, long-press is used."""
         c = self.cfg
         if a == b and c["hold_deploy"] and n >= 3 and card:
             ms = min(n * c["hold_ms_per_troop"], 8000)
@@ -3059,9 +3044,9 @@ class Bot:
                     break
             return
         pts = [self.along(a, b, k, n) for k in range(n)]
-        gap = max(0.0, c["deploy_tap_delay"])
-        if fast_taps(self.adb, pts):
-            return
+        # Raw touches can report success without reaching the game on some emulator builds. ADB input taps are
+        # slower, but use the same path as card selection and reliably reach the game.
+        gap = max(self.speed()[0], 0.05)
         for i in range(0, n, 20):  # one shell call per 20 taps - fast, no round trip per troop
             chunk = pts[i:i + 20]
             self.adb.shell(f"; sleep {gap}; ".join(f"input tap {x} {y}" for x, y in chunk), timeout=10 + len(chunk))
@@ -3071,9 +3056,13 @@ class Bot:
         it), then every hero / siege machine / pet (one tap each)."""
         cards = cards or troop_bar(self.shot())  # the deploy's debug read, when there was one
         troops = [cd for cd in cards if cd[2] == "troop" and cd[3]]
-        spells = [cd for cd in cards if cd[2] == "spell" and cd[3]] if self.cfg["deploy_spells"] else []
+        spell_cards = [cd for cd in cards if cd[2] == "spell" and cd[3]]
+        spells = spell_cards if self.cfg["deploy_spells"] else []
         singles = [cd for cd in cards if cd[2] == "single"]
-        if not troops and not singles:
+        if spell_cards and not self.cfg["deploy_spells"]:
+            self.log(f"Skipped {len(spell_cards)} spell type(s): spell deployment is disabled in Battle settings.",
+                     "warn")
+        if not troops and not singles and not spells:
             return False
         fp = self.cfg["fixed_points"]
         if fp.get("spell_point"):  # their own line, if set
@@ -3081,20 +3070,19 @@ class Bot:
         else:  # else around the middle of the troop line
             sa, sb = self.along(a, b, 1, 4), self.along(a, b, 2, 4)
         for x, y, _, n in spells:  # spells FIRST, as taps spread along their line (a hold doesn't cast them)
-            self.tap((x, y), self.cfg["deploy_select_delay"])
+            self.tap((x, y), self.speed()[1])
             self.drop(sa, sb, n, None)
-        delay = self.cfg["deploy_select_delay"]
+        delay = self.speed()[1]
         for x, y, _, n in troops:  # every troop on the saved line - the camera pans to the same spot each battle
             self.tap((x, y), delay)
             self.drop(a, b, n, (x, y))
-        for k, (x, y, _, _) in enumerate(singles):  # heroes / siege spread evenly along the same line
-            if not fast_taps(self.adb, [(x, y)]) or not fast_taps(self.adb, [self.along(a, b, k, len(singles))]):
-                self.tap((x, y), delay)
-                self.adb.tap(*self.along(a, b, k, len(singles)))
-            self.sleep(0.1)
+        for k, (x, y, _, _) in enumerate(singles):  # heroes / siege spread evenly along same line
+            self.tap((x, y), delay)
+            self.tap(self.along(a, b, k, len(singles)), 0.1)
         self._ability_cards = [(x, y) for x, y, _, _ in singles]  # tapping a deployed hero's card = its ability
-        self.log(f"Auto-deployed {sum(cd[3] for cd in troops)} troops ({len(troops)} types), "
-                 f"{len(singles)} heroes/siege" + (f", {len(spells)} spell types." if spells else "."))
+        self.log(f"Placement taps sent: {sum(cd[3] for cd in troops)} troops ({len(troops)} types), "
+                 f"{len(singles)} heroes/siege, {sum(cd[3] for cd in spells)} spells "
+                 f"({len(spells)} types).")
         return True
 
     def close_popups(self):
@@ -3113,7 +3101,7 @@ class Bot:
 
     # --- recovery ---
     def emulator_restart_allowed(self):
-        return self.cfg["watchdog_enabled"] and os.path.exists(self.cfg["emulator_exe_path"])
+        return self.cfg["watchdog_enabled"] and os.path.isfile(self.cfg["emulator_exe_path"])
 
     def launch_game(self):
         pkg, act = self.cfg["coc_package_name"], self.cfg["coc_activity_name"]
@@ -3194,20 +3182,16 @@ class Bot:
         """Buttons, drop lines and text boxes are all 1920x1080 pixels. The monitor doesn't matter (screenshots
         come from inside the emulator), but BlueStacks' own resolution does: set it back and restart BlueStacks."""
         h, w = frame.shape[:2]
-        conf = BS_CONF
+        conf = r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf"
         if getattr(self, "_res_fixed", False) or not self.emulator_restart_allowed() or not os.path.exists(conf):
             self.log(f"The emulator is {w}x{h} but must be 1920x1080: BlueStacks Settings > Display > "
-                     + ("1920x1080, DPI 240" if IS_WIN else "Landscape/1920x1080")
-                     + ", then restart BlueStacks.", "err")
+                     "1920x1080, DPI 240, then restart BlueStacks.", "err")
             self.sleep(60)
             return
         self._res_fixed = True
         self.log(f"The emulator is {w}x{h} - setting BlueStacks to 1920x1080 and restarting it.", "warn")
 
-        # BlueStacks Air keeps its panel config in portrait (1080x1920) and rotates it for landscape.
-        want = ({"fb_width": "1920", "fb_height": "1080", "dpi": "240"} if IS_WIN
-                else {"fb_width": "1080", "fb_height": "1920", "dpi": "320"})
-        self.restart_emulator(while_closed=lambda: bs_conf_set(want))
+        self.restart_emulator(while_closed=lambda: bs_conf_set({"fb_width": "1920", "fb_height": "1080", "dpi": "240"}))
 
     def restart_emulator(self, while_closed=None):
         now = time.time()
@@ -3219,15 +3203,8 @@ class Bot:
         exe = self.cfg["emulator_exe_path"]
         self.log("Restarting the emulator...", "err")
         self.adb.close_shell()
-        if IS_MAC:
-            subprocess.run(["osascript", "-e", 'quit app "BlueStacks"'], capture_output=True, timeout=30)
-            self.sleep(5)
-            if process_running(exe):  # refused to quit politely
-                subprocess.run(["pkill", "-f", "BlueStacks.app/Contents/MacOS/BlueStacks"],
-                               capture_output=True, timeout=20)
-        else:
-            subprocess.run(["taskkill", "/IM", os.path.basename(exe), "/T", "/F"], capture_output=True,
-                           timeout=20, creationflags=NO_WINDOW)
+        subprocess.run(["taskkill", "/IM", os.path.basename(exe), "/T", "/F"], capture_output=True,
+                       timeout=20, creationflags=NO_WINDOW)
         self.sleep(5)
         try:  # BlueStacks rewrites its conf on exit, so settings are changed only while it's closed
             bs_conf_set(GFX_PROFILES[min(int(self.cfg.get("gfx_profile", 0)), len(GFX_PROFILES) - 1)][1])
@@ -3235,13 +3212,7 @@ class Bot:
                 while_closed()
         except OSError as e:
             self.log(f"Couldn't change BlueStacks' settings: {e}", "err")
-        if IS_MAC:
-            args = ["open", "-a", "BlueStacks"]
-            if self.cfg["emulator_launch_args"].split():
-                args += ["--args", *self.cfg["emulator_launch_args"].split()]
-            subprocess.run(args, capture_output=True, timeout=30)
-        else:
-            subprocess.Popen([exe, *self.cfg["emulator_launch_args"].split()], **DETACHED)
+        subprocess.Popen([exe, *self.cfg["emulator_launch_args"].split()], creationflags=0x00000008)  # detached
         self.sleep(self.cfg["emulator_boot_wait"])
         end = time.time() + self.cfg["adb_ready_timeout"]
         while time.time() < end:
@@ -3328,14 +3299,7 @@ class PhoneView:
 
 
 def _pid_image(pid):
-    """Executable path of a running process, or None if it isn't running."""
-    if IS_MAC:
-        try:
-            r = subprocess.run(["ps", "-p", str(int(pid)), "-o", "comm="], capture_output=True, text=True, timeout=5)
-            return r.stdout.strip() or None
-        except Exception:
-            return None
-    import ctypes
+    """Full exe path of a running process, or None if it isn't running (Windows)."""
     k32 = ctypes.windll.kernel32
     h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
     if not h:
@@ -3363,14 +3327,13 @@ class Tunnel:
 
     def _alive(self, st):
         img = _pid_image(st.get("pid", 0)) if st else None
-        return bool(img and img.lower().endswith("cloudflared.exe" if IS_WIN else "cloudflared")
-                    and st.get("port") == self.port)
+        return bool(img and img.lower().endswith("cloudflared.exe") and st.get("port") == self.port)
 
     def _start(self):
         with open(self.LOG, "w") as lf:
             proc = subprocess.Popen([self.exe, "tunnel", "--no-autoupdate", "--url", f"http://localhost:{self.port}"],
                                     stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                    **DETACHED_TUNNEL)
+                                    creationflags=0x00000008 | 0x00000200)  # DETACHED | NEW_PROCESS_GROUP
         for _ in range(60):
             time.sleep(1)
             try:
@@ -3435,13 +3398,7 @@ class Tunnel:
 
     @staticmethod
     def _kill(st):
-        if IS_WIN:
-            subprocess.run(["taskkill", "/PID", str(st["pid"]), "/F"], capture_output=True, creationflags=NO_WINDOW)
-        else:
-            try:
-                os.kill(int(st["pid"]), 15)  # SIGTERM
-            except Exception:
-                pass
+        subprocess.run(["taskkill", "/PID", str(st["pid"]), "/F"], capture_output=True, creationflags=NO_WINDOW)
         time.sleep(1)
 
     @staticmethod
@@ -3470,13 +3427,9 @@ class Tunnel:
         """Stop a background tunnel left running (used when the public link is turned off)."""
         try:
             st = json.load(open(Tunnel.STATE))
-            img = (_pid_image(st["pid"]) or "").lower()
-            if img.endswith("cloudflared.exe" if IS_WIN else "cloudflared"):
-                if IS_WIN:
-                    subprocess.run(["taskkill", "/PID", str(st["pid"]), "/F"], capture_output=True,
-                                   creationflags=NO_WINDOW)
-                else:
-                    os.kill(int(st["pid"]), 15)  # SIGTERM
+            if (_pid_image(st["pid"]) or "").lower().endswith("cloudflared.exe"):
+                subprocess.run(["taskkill", "/PID", str(st["pid"]), "/F"], capture_output=True,
+                               creationflags=NO_WINDOW)
         except Exception:
             pass
 
@@ -3499,8 +3452,7 @@ def pan_view(adb, where, frame_w=1920, frame_h=1080):
         time.sleep(0.15)
 
 
-BS_CONF = r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf" if IS_WIN else _first_path(
-    BS_CONF_MAC, os.path.expanduser("~/Library/Application Support/BlueStacks/bluestacks.conf")) or BS_CONF_MAC
+BS_CONF = r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf"
 # Graphics setups to try, in order, when BlueStacks keeps crashing (typically on the game's loading clouds - a
 # graphics-driver crash, e.g. NVIDIA + Vulkan). 0 = leave BlueStacks as the user set it.
 GFX_PROFILES = [
@@ -3527,13 +3479,6 @@ def bs_conf_set(values):
 
 def process_running(exe):
     try:
-        if IS_MAC:
-            # BlueStacks Air's engine runs as /Applications/BlueStacks.app/Contents/MacOS/BlueStacks
-            if exe.rstrip("/").endswith(".app"):
-                cmd = ["pgrep", "-f", os.path.basename(exe.rstrip("/"))[:-4] + ".app/Contents/MacOS/"]
-            else:
-                cmd = ["pgrep", "-x", os.path.basename(exe)]
-            return bool(subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout.strip())
         out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {os.path.basename(exe)}", "/NH"], capture_output=True,
                              text=True, timeout=15, creationflags=NO_WINDOW).stdout
     except Exception:
@@ -3588,18 +3533,8 @@ def post_discord(cfg, text, files=()):
 def single_instance():
     """A machine-wide lock so only one Loot Farmer drives the emulator. Waits a few seconds first, so the
     Restart / Update buttons (new copy starts while the old one closes) still work. None = another is running."""
-    if not IS_WIN:
-        import fcntl
-        lock_path = os.path.join(tempfile.gettempdir(), "LootFarmerBot.lock")
-        for _ in range(20):
-            try:
-                fh = open(lock_path, "w")
-                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return fh  # held for as long as this process lives
-            except OSError:
-                time.sleep(0.5)
-        return None
-    import ctypes
+    if os.name != "nt":
+        return True
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.CreateMutexW.restype = ctypes.c_void_p
     k32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
@@ -3615,7 +3550,6 @@ def single_instance():
 
 
 _TOUCH = {}
-TOUCH_TMP = "/data/local/tmp/lootfarmer_touch"  # scratch file for raw events on macOS (see touch_event_writer)
 
 
 def touch_device(adb):
@@ -3650,48 +3584,6 @@ def touch_ev(adb):
     return _TOUCH["ev"]
 
 
-def touch_panel_rotated(adb, W=1920, H=1080):
-    """True when the touch panel is a portrait panel shown rotated (BlueStacks Air on macOS: the emulator
-    reports a 1080x1920 panel and rotates it, so raw touch axes are swapped against the 1920x1080 screenshot).
-    Verified on the emulator with Android's pointer-location overlay. BlueStacks 5 on Windows is natively
-    landscape, so this is False there."""
-    if "rot" not in _TOUCH:
-        rot = False
-        try:
-            m = re.search(r"Physical size:\s*(\d+)x(\d+)", adb.shell("wm size", timeout=10))
-            if m:
-                pw, ph = int(m.group(1)), int(m.group(2))
-                rot = ph > pw and W > H  # portrait panel, landscape screen
-        except ADBError:
-            pass
-        _TOUCH["rot"] = rot
-    return _TOUCH["rot"]
-
-
-def touch_raw(x, y, mx, my, W=1920, H=1080, rotated=False):
-    """Screenshot (landscape) pixel -> raw touch-device coordinate."""
-    if rotated:  # panel turned 90 degrees: screen x runs along raw y, screen y is mirrored along raw x
-        return int((H - y) / H * mx), int(x / W * my)
-    return int(x / W * mx), int(y / H * my)
-
-
-def touch_writer(dev, ev):
-    """write_seq(events): the shell command that pushes them to the touch device as whole input_events.
-    Windows takes the decoded struct in one write. macOS/BlueStacks Air does NOT: toybox's base64 writes the
-    decoded bytes in 3-byte pieces, and the kernel rejects anything that isn't a whole event (EINVAL), so every
-    pinch silently did nothing - decode to a file, then dd it out in exact event-sized blocks instead."""
-    size = len(ev(0, 0, 0))
-
-    def write(seq):
-        data = base64.b64encode(seq).decode()
-        if IS_MAC:
-            return (f"echo {data} | base64 -d > {TOUCH_TMP}; "
-                    f"dd if={TOUCH_TMP} of={dev} bs={size} 2>/dev/null")
-        return f"echo {data} | base64 -d > {dev}"  # Windows: the whole struct in one write
-
-    return write
-
-
 def zoom_out(adb, times=3, W=1920, H=1080, spread=((460, 900), (1460, 1020))):
     """Two-finger pinch (fingers moving together) = the game's zoom-out, sent straight to the touch device.
     Stops at the game's limit, so extra pinches are harmless. Raw input_event structs are written in one shell
@@ -3702,25 +3594,23 @@ def zoom_out(adb, times=3, W=1920, H=1080, spread=((460, 900), (1460, 1020))):
         return False
     dev, mx, my = d
     ev = touch_ev(adb)
-    rotated = touch_panel_rotated(adb, W, H)
-    write = touch_writer(dev, ev)
     for _ in range(times):
         steps = []
         for i in range(9):
             f, b = i / 8, b""
             for slot, (x0, x1) in enumerate(spread):
-                rx, ry = touch_raw(x0 + (x1 - x0) * f, 480, mx, my, W, H, rotated)  # both fingers mid-screen
                 b += ev(3, 47, slot) + (ev(3, 57, 100 + slot) if i == 0 else b"")
-                b += ev(3, 53, rx) + ev(3, 54, ry)
+                b += ev(3, 53, int((x0 + (x1 - x0) * f) / W * mx)) + ev(3, 54, int(480 / H * my))
             b += (ev(1, 330, 1) if i == 0 else b"") + ev(0, 0, 0)  # BTN_TOUCH down with the first frame
             steps.append(b)
         steps.append(ev(3, 47, 0) + ev(3, 57, -1) + ev(3, 47, 1) + ev(3, 57, -1) + ev(1, 330, 0) + ev(0, 0, 0))
-        adb.shell("; sleep 0.02; ".join(write(s) for s in steps), timeout=30)
+        adb.shell("; sleep 0.02; ".join(f"echo {base64.b64encode(s).decode()} | base64 -d > {dev}" for s in steps),
+                  timeout=30)
         time.sleep(0.3)
     return True
 
 
-def fast_taps(adb, pts, W=1920, H=1080):
+def fast_taps(adb, pts, gap=0.0, W=1920, H=1080):
     """Taps as raw touch events written straight to the touch device - the device opened once, each tap held
     20 ms (with no hold the game drops some). ~0.05 s a tap instead of ~0.19 s for `input tap`, which starts a
     Java process every time. False if there's no touch device (the caller falls back to `input tap`)."""
@@ -3730,29 +3620,28 @@ def fast_taps(adb, pts, W=1920, H=1080):
     dev, mx, my = d
     ev = touch_ev(adb)
     raw = lambda bs: "".join(f"\\{x:03o}" for x in bs)  # printf escapes: exactly 3 octal digits a byte
-    rotated = touch_panel_rotated(adb, W, H)  # BlueStacks Air's panel is rotated: without this every tap lands wrong
     up = raw(ev(3, 47, 0) + ev(3, 57, -1) + ev(1, 330, 0) + ev(0, 0, 0))
-    cmds = []
-    for i, (x, y) in enumerate(pts):
-        rx, ry = touch_raw(x, y, mx, my, W, H, rotated)
-        down = ev(3, 47, 0) + ev(3, 57, 200 + i % 100) + ev(3, 53, rx) + ev(3, 54, ry) + ev(1, 330, 1) + ev(0, 0, 0)
-        cmds.append(f"printf '{raw(down)}' >&3; sleep 0.02; printf '{up}' >&3")
+    cmds = [f"printf '{raw(ev(3, 47, 0) + ev(3, 57, 200 + i % 100) + ev(3, 53, int(x / W * mx)) + ev(3, 54, int(y / H * my)) + ev(1, 330, 1) + ev(0, 0, 0))}' >&3; sleep 0.02; printf '{up}' >&3"
+            for i, (x, y) in enumerate(pts)]
     for i in range(0, len(cmds), 30):
-        adb.shell(f"exec 3> {dev}; " + "; ".join(cmds[i:i + 30]) + "; exec 3>&-", timeout=20)
+        sep = f"; sleep {gap}; " if gap else "; "
+        adb.shell(f"exec 3> {dev}; " + sep.join(cmds[i:i + 30]) + "; exec 3>&-", timeout=20 + gap * 30)
     return True
 
 
 def battery():
-    """(percent, plugged_in), or None on a machine without a battery the bot can read."""
-    if IS_MAC:
-        try:  # pmset works on MacBooks; a Mac mini/Studio reports no battery -> None
-            out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=10).stdout
-            m = re.search(r"(\d+)%", out)
-            if not m or "InternalBattery" not in out:
-                return None
-            return int(m.group(1)), "AC Power" in out
+    """(percent, plugged_in) where the host exposes a battery reading."""
+    if sys.platform == "darwin":
+        try:  # MacBooks expose battery state through pmset; desktops have no battery to report
+            out = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True,
+                                 timeout=5).stdout
+            pct = re.search(r"(\d+)%", out)
+            source = re.search(r"Now drawing from '([^']+)'", out)
+            return (int(pct.group(1)), source.group(1) == "AC Power") if pct and source else None
         except Exception:
             return None
+    if os.name != "nt":
+        return None
 
     class SPS(ctypes.Structure):
         _fields_ = [("ac", ctypes.c_ubyte), ("flag", ctypes.c_ubyte), ("pct", ctypes.c_ubyte),
@@ -3832,7 +3721,7 @@ class DropLinePicker(tk.Toplevel):
                 self.cv.create_oval(x - r, y - r, x + r, y + r, outline="white", width=S(3), fill=col)
                 for dx, dy, c in ((2, 2, "black"), (0, 0, "white")):
                     self.cv.create_text(x + r + 6 + dx, y - r - 6 + dy, text=label, fill=c, anchor="w",
-                                        font=(UI_FONT, 12, "bold"))
+                                        font=("Segoe UI", 12, "bold"))
         self.info.config(text=f"Start: {tuple(a) if a else '-'}     End: {tuple(b) if b else '- (one spot only)'}")
 
     def click(self, e):
@@ -4047,10 +3936,10 @@ class PlannerTab(ttk.Frame):
     # plain tk widgets inside the lists: themed ttk ones made each redraw take seconds
     def _lbl(self, parent, text="", bold=False, muted=False, size=10, **kw):
         return tk.Label(parent, text=text, bg=kw.pop("bg", CARD), fg=MUTED if muted else TEXT, anchor="w",
-                        font=(UI_FONT, size, "bold" if bold else "normal"), justify="left", **kw)
+                        font=("Segoe UI", size, "bold" if bold else "normal"), justify="left", **kw)
 
     def _chip(self, parent, text, cmd):
-        c = tk.Label(parent, text=text, bg="#3a3a3a", fg=TEXT, font=(UI_FONT, 9, "bold"), padx=S(7), pady=S(3),
+        c = tk.Label(parent, text=text, bg="#3a3a3a", fg=TEXT, font=("Segoe UI", 9, "bold"), padx=S(7), pady=S(3),
                      cursor="hand2")
         c.bind("<Button-1>", lambda e: cmd())
         return c
@@ -4148,16 +4037,16 @@ class PlannerTab(ttk.Frame):
             cv.create_image(pad, pad, image=ic, anchor="nw")
         tx = pad + S(64)
         y = cv.bbox(cv.create_text(tx, pad, text=e["name"], anchor="nw", fill=TEXT,
-                                   font=(UI_FONT, 11, "bold"), width=right - tx))[3]
-        y = cv.bbox(cv.create_text(tx, y + S(2), text=have, anchor="nw", fill=MUTED, font=(UI_FONT, 9),
+                                   font=("Segoe UI", 11, "bold"), width=right - tx))[3]
+        y = cv.bbox(cv.create_text(tx, y + S(2), text=have, anchor="nw", fill=MUTED, font=("Segoe UI", 9),
                                    width=right - tx))[3]
         if mx:
             y = cv.bbox(cv.create_text(tx, y + S(2), text=f"max {mx} at this hall", anchor="nw", fill=MUTED,
-                                       font=(UI_FONT, 9)))[3]
+                                       font=("Segoe UI", 9)))[3]
         y = max(y, pad + S(56)) + S(8)
         info = {"frame": cv, "chips": [], "x": None, "name": e["name"].lower(), "cat": category_of(k.split(":", 1)[1])}
         if cur is None or mx is None or cur >= mx:
-            y = cv.bbox(cv.create_text(pad, y, anchor="nw", fill=MUTED, font=(UI_FONT, 9), text=(
+            y = cv.bbox(cv.create_text(pad, y, anchor="nw", fill=MUTED, font=("Segoe UI", 9), text=(
                 "✓ maxed for this hall" if cur is not None and mx and cur >= mx else "(level couldn't be read)")))[3]
             cv.configure(height=y + pad)
             return info
@@ -4166,7 +4055,7 @@ class PlannerTab(ttk.Frame):
         def chip(text, cmd, line):
             line = max(line, row[0])  # stay on the row an earlier chip wrapped to
             t = cv.create_text(x[0] + S(7), line + S(3), text=text, anchor="nw", fill=TEXT,
-                               font=(UI_FONT, 9, "bold"))
+                               font=("Segoe UI", 9, "bold"))
             x0, y0, x1, y1 = cv.bbox(t)
             if x1 + S(7) > right and x[0] > pad + S(60):  # no room left on this row: wrap under it
                 cv.move(t, pad - x[0], y1 - y0 + S(12))
@@ -4182,7 +4071,7 @@ class PlannerTab(ttk.Frame):
             return r, t
         line = y
         x[0] = cv.bbox(cv.create_text(pad, line + S(3), text="Up to:", anchor="nw", fill=MUTED,
-                                      font=(UI_FONT, 9)))[2] + S(6)
+                                      font=("Segoe UI", 9)))[2] + S(6)
         targets = list(range(cur + 1, mx + 1))
         many = len(targets) > 6  # heroes have dozens of levels: next few + max, plus a picker for any level
         if many:
@@ -4194,7 +4083,7 @@ class PlannerTab(ttk.Frame):
         y = cv.bbox("all")[3] + S(8)
         if many:
             x[0] = cv.bbox(cv.create_text(pad, y + S(3), text="or level", anchor="nw", fill=MUTED,
-                                          font=(UI_FONT, 9)))[2] + S(6)
+                                          font=("Segoe UI", 9)))[2] + S(6)
             sp = tk.Spinbox(cv, from_=cur + 1, to=mx, width=5, bg="#3a3a3a", fg=TEXT, buttonbackground=CARD,
                             relief="flat", insertbackground=TEXT)
             x[0] = cv.bbox(cv.create_window(x[0], y, window=sp, anchor="nw"))[2] + S(6)
@@ -4333,8 +4222,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         global UI_SCALE
-        # Windows scales fonts with the display; macOS Tk reports 72 dpi (would shrink the UI to 75%)
-        UI_SCALE = 1.0 if IS_MAC else self.winfo_fpixels("1i") / 96
+        UI_SCALE = self.winfo_fpixels("1i") / 96
         self.title("Loot Farmer")
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{min(S(1240), int(sw * .92))}x{min(S(800), int(sh * .85))}+{int(sw * .04)}+{int(sh * .03)}")
@@ -4360,9 +4248,7 @@ class App(tk.Tk):
             key, port = self.cfg["phone_view_key"], self.cfg["phone_view_port"]
             try:
                 self.phone = PhoneView(port, key)
-                exe = os.path.join(BASE_DIR, "cloudflared.exe" if IS_WIN else "cloudflared")
-                if not os.path.isfile(exe) and not IS_WIN:
-                    exe = shutil.which("cloudflared") or exe  # brew install cloudflared
+                exe = os.path.join(BASE_DIR, "cloudflared.exe")
                 if self.cfg["public_link_enabled"] and os.path.isfile(exe):
                     self.tunnel = Tunnel(exe, port, lambda url: self.ui(lambda: self._public_url(url)))
                 else:
@@ -4396,20 +4282,21 @@ class App(tk.Tk):
         self.q.put(("call", fn))
 
     def log(self, msg, level="info"):
+        getattr(log_file, {"ok": "info", "warn": "warning", "err": "error"}.get(level, "info"))(msg)  # in reports too
         self.emit("log", (level, msg))
 
     def _styles(self):
         s = ttk.Style(self)
-        f = "Segoe UI Variable Display" if "Segoe UI Variable Display" in self.tk.call("font", "families") else UI_FONT
+        f = "Segoe UI Variable Display" if "Segoe UI Variable Display" in self.tk.call("font", "families") else "Segoe UI"
         s.configure("Title.TLabel", font=(f, 20, "bold"))
-        s.configure("Sub.TLabel", font=(UI_FONT, 10), foreground=MUTED)
-        s.configure("CardTitle.TLabel", font=(UI_FONT, 9, "bold"), foreground=MUTED)
+        s.configure("Sub.TLabel", font=("Segoe UI", 10), foreground=MUTED)
+        s.configure("CardTitle.TLabel", font=("Segoe UI", 9, "bold"), foreground=MUTED)
         s.configure("CardValue.TLabel", font=(f, 22, "bold"))
         s.configure("Big.TLabel", font=(f, 15, "bold"))
         s.configure("Res.TLabel", font=(f, 17, "bold"))
         s.configure("Muted.TLabel", foreground=MUTED)
-        s.configure("Pill.TLabel", font=(UI_FONT, 10, "bold"))
-        s.configure("Start.Accent.TButton", font=(UI_FONT, 11, "bold"), padding=S(22, 9))
+        s.configure("Pill.TLabel", font=("Segoe UI", 10, "bold"))
+        s.configure("Start.Accent.TButton", font=("Segoe UI", 11, "bold"), padding=S(22, 9))
         s.configure("Treeview", rowheight=S(30))
 
     def card(self, parent, title, **grid):
@@ -4422,7 +4309,7 @@ class App(tk.Tk):
     def text_widget(self, parent, height):
         t = tk.Text(parent, height=height, bg="#141414", fg=TEXT, insertbackground=TEXT, relief="flat",
                     font=("Cascadia Mono", 9) if "Cascadia Mono" in self.tk.call("font", "families")
-                    else (MONO_FONT, 9), padx=S(10), pady=S(8), wrap="word", borderwidth=0, highlightthickness=0)
+                    else ("Consolas", 9), padx=S(10), pady=S(8), wrap="word", borderwidth=0, highlightthickness=0)
         for lvl, col in LEVEL_COLORS.items():
             t.tag_configure(lvl, foreground=col)
         t.tag_configure("ts", foreground="#6b6b6b")
@@ -4439,7 +4326,7 @@ class App(tk.Tk):
         ttk.Label(left, text="Clash of Clans  ·  unattended resource farming", style="Sub.TLabel").pack(anchor="w")
         if self.phone:
             self.public_label = ttk.Label(left, text="🌍  Anywhere link: starting…" if self.tunnel else
-                                          "🌍  Anywhere link: install cloudflared" if IS_MAC else "🌍  Anywhere link: add cloudflared.exe next to bot.py",
+                                          "🌍  Anywhere link: add cloudflared.exe next to bot.py",
                                           style="Sub.TLabel", foreground=BLUE if self.tunnel else MUTED,
                                           cursor="hand2")
             self.public_label.pack(anchor="w")
@@ -4528,7 +4415,7 @@ class App(tk.Tk):
         self.preview = tk.Canvas(live, bg="#141414", highlightthickness=0, height=S(240))
         self.preview.pack(fill="both", expand=True)
         self.preview.create_text(10, 10, anchor="nw", text="The emulator screen appears here while farming.",
-                                 fill=MUTED, font=(UI_FONT, 10), tags="hint")
+                                 fill=MUTED, font=("Segoe UI", 10), tags="hint")
         self._photo = None
 
         side = ttk.Frame(tab)
@@ -4710,7 +4597,7 @@ class App(tk.Tk):
         bar = ttk.Frame(tab)
         bar.pack(fill="x", pady=S(0, 10))
         ttk.Label(bar, text=f"Also saved to {LOG_FILE}", style="Muted.TLabel").pack(side="left")
-        ttk.Button(bar, text="Open log file", command=lambda: open_path(LOG_FILE)).pack(side="right")
+        ttk.Button(bar, text="Open log file", command=lambda: os.startfile(LOG_FILE)).pack(side="right")
         ttk.Button(bar, text="Clear", command=self._clear_log).pack(side="right", padx=S(8))
         self.full_log = self.text_widget(tab, 20)
         sb = ttk.Scrollbar(tab, command=self.full_log.yview)
@@ -4837,13 +4724,32 @@ class App(tk.Tk):
             new = f"{url}/?k={self.cfg['phone_view_key']}"
             if new != self.public_url:
                 self.log(f"Anywhere link ready: {new}", "ok")
-                self.bg(lambda: post_discord(self.cfg, f"🟢 **Loot Farmer v{APP_VERSION}** is running on "
-                                                       f"**{host_name()}**\n{new}"))
+                self.announce(f"🟢 **Loot Farmer v{APP_VERSION}** is running on "
+                              f"**{os.environ.get('COMPUTERNAME', 'a PC')}**\n{new}")
             self.public_url = new
             self.public_label.config(text="🌍  Anywhere link  (click to copy)", foreground=BLUE)
         else:
             self.public_url = ""
             self.public_label.config(text="🌍  Anywhere link: reconnecting…", foreground=AMBER)
+
+    def announce(self, text):
+        """Post the link to Discord and keep at it - every minute for up to an hour (PC just woke up, network or
+        Discord down...) - saying in the log whether it got there. A newer message replaces one still waiting."""
+        self._announce_id = getattr(self, "_announce_id", 0) + 1
+        my = self._announce_id
+
+        def work():
+            for i in range(60):
+                if my != self._announce_id:
+                    return  # superseded by a newer link / start message
+                if post_discord(self.cfg, text):
+                    return self.log("Anywhere link sent to Discord.", "ok")
+                if i == 0:
+                    self.log("Couldn't reach Discord to send the Anywhere link - retrying every minute.", "warn")
+                time.sleep(60)
+            self.log("Gave up sending the Anywhere link to Discord after an hour (check the webhook in Settings).",
+                     "warn")
+        threading.Thread(target=work, daemon=True).start()
 
     def _set_pill(self, ok):
         self.pill.config(text="●  Connected" if ok else "●  Offline", foreground=GREEN if ok else RED)
@@ -4906,8 +4812,7 @@ class App(tk.Tk):
         self.started_at = time.time()
         if self.public_url:  # the start-up post can be missed (PC asleep, network not up yet): send it again
             url = self.public_url
-            pc = host_name()
-            self.bg(lambda: post_discord(self.cfg, f"▶️ Farming started on **{pc}**\n{url}"))
+            self.announce(f"▶️ Farming started on **{os.environ.get('COMPUTERNAME', 'a PC')}**\n{url}")
         for m, (btn, _) in self.mode_buttons().items():
             if m == mode:
                 btn.config(text={"farm": "■  Stop farming", "loot": "■  Stop looting", "walls": "■  Stop walls"}[m])
@@ -5101,7 +5006,10 @@ class App(tk.Tk):
 
     def _restart_now(self):
         self._close()
-        subprocess.Popen([python_gui_exe(), os.path.abspath(__file__)], cwd=BASE_DIR, **DETACHED)
+        exe = sys.executable
+        if os.name == "nt" and exe.lower().endswith("python.exe") and os.path.exists(exe[:-10] + "pythonw.exe"):
+            exe = exe[:-10] + "pythonw.exe"
+        subprocess.Popen([exe, os.path.abspath(__file__)], cwd=BASE_DIR, creationflags=0x00000008)
 
     def send_report(self, reason, auto=False):
         """bot.log, the debug screenshots, the live screen and the non-secret settings to the Discord webhook.
@@ -5119,7 +5027,7 @@ class App(tk.Tk):
                     files.append(("bot.log", hide.sub("k=<hidden>", "".join(f.readlines()[-400:])).encode()))
             except OSError:
                 pass
-            for name in ("debug_deploy.png", "debug_wall.png", "debug_boat.png", "debug_unknown.png"):
+            for name in ("debug_deploy.png", "debug_deploy_after.png", "debug_wall.png", "debug_boat.png"):
                 path = os.path.join(BASE_DIR, name)
                 if os.path.exists(path) and time.time() - os.path.getmtime(path) < 6 * 3600:
                     img = cv2.imread(path)
@@ -5133,7 +5041,7 @@ class App(tk.Tk):
             secret = ("groq_api_key", "phone_view_key", "discord_webhook")
             files.append(("settings.json", json.dumps({k: v for k, v in self.cfg.items() if k not in secret},
                                                       indent=1).encode()))
-            text = (f"🐞 **Debug report** from **{host_name()}** (v{APP_VERSION}) - "
+            text = (f"🐞 **Debug report** from **{os.environ.get('COMPUTERNAME', 'a PC')}** (v{APP_VERSION}) - "
                     f"{reason}\nState: {self.state_label.cget('text')}")
             if post_discord(self.cfg, text, files):
                 self.log(f"Debug report sent to Discord ({len(files)} files).", "ok")
@@ -5147,7 +5055,10 @@ class App(tk.Tk):
             return
         self.log("Restarting…")
         self._close()
-        subprocess.Popen([python_gui_exe(), os.path.abspath(__file__)], cwd=BASE_DIR, **DETACHED)  # detached
+        exe = sys.executable
+        if os.name == "nt" and exe.lower().endswith("python.exe") and os.path.exists(exe[:-10] + "pythonw.exe"):
+            exe = exe[:-10] + "pythonw.exe"  # no console window
+        subprocess.Popen([exe, os.path.abspath(__file__)], cwd=BASE_DIR, creationflags=0x00000008)  # detached
 
     def _close(self):
         if self.bot:
@@ -5482,7 +5393,7 @@ def make_package():
                   auto_connect_target=DEFAULTS["auto_connect_target"], watchdog_enabled=False)
     out = os.path.join(BASE_DIR, "LootFarmer_share.zip")
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in ("bot.py", "setup.ps1", "Setup.bat", "setup_mac.sh", "README.txt"):
+        for f in ("bot.py", "setup.ps1", "Setup.bat", "README.txt"):
             z.write(os.path.join(BASE_DIR, f), f"LootFarmer/{f}")
         for folder in ("Tesseract-OCR", "platform-tools"):  # bundled tools: nothing to install
             for root, _, files in os.walk(os.path.join(BASE_DIR, folder)):
@@ -5499,8 +5410,7 @@ def make_package():
     print(f"Created {out}")
 
 
-PUBLISHED = ("bot.py", "setup.ps1", "Setup.bat", "setup_mac.sh", "README.txt", ".gitignore",
-             ".gitattributes")
+PUBLISHED = ("bot.py", "setup.ps1", "Setup.bat", "README.txt", ".gitignore", ".gitattributes")
 
 
 def published_files():
@@ -5610,7 +5520,7 @@ def make_update():
     their drop lines, settings and account setup; new settings get their defaults) and no bundled tools."""
     out = os.path.join(BASE_DIR, "LootFarmer_update.zip")
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in ("bot.py", "setup.ps1", "Setup.bat", "setup_mac.sh", "README.txt"):
+        for f in ("bot.py", "setup.ps1", "Setup.bat", "README.txt"):
             z.write(os.path.join(BASE_DIR, f), f"LootFarmer/{f}")
         for f in sorted(os.listdir(TEMPLATE_DIR)):
             if f.endswith(".png") and not f.startswith("old_"):
