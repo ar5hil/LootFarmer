@@ -254,6 +254,7 @@ DEFAULTS = {
     "bb_lab_upgrades": True,
     "bb_bonus_days": {},  # account -> date its daily Star Bonus was collected (no more attacks that day)
     "bank_spend_threshold": 15000000,
+    "wall_reserve": 3000000,  # never spend the last of this much gold/elixir on walls: below it, go looting
     "bank_scroll_duration_ms": 600,
     "bank_scroll_delay": 0.6,
     "bank_post_spend_delay": 1.0,
@@ -313,13 +314,14 @@ SETTINGS = [
         ("deploy_tap_delay", "Pause between taps (s)", float),
     ]),
     ("Upgrades", "From the home screen: free builders and the lab take the most expensive thing you can "
-                 "afford; walls use storage above the threshold. The 'Walls only' button ignores the threshold: "
-                 "it spends every coin on walls first and only loots when the next upgrade is out of reach.", [
+                 "afford; walls use storage above the threshold. The 'Walls only' button ignores that threshold: "
+                 "it spends on walls until only the reserve is left, then starts looting.", [
         ("builder_upgrades_enabled", "Builders: upgrade buildings / heroes", bool),
         ("skip_town_hall", "Never upgrade the Town Hall (don't rush)", bool),
         ("lab_upgrades_enabled", "Lab: research troops / spells", bool),
         ("bank_spend_enabled", "Buy walls when storage is full", bool),
         ("bank_spend_threshold", "Spend when storage >=", int),
+        ("wall_reserve", "Keep in storage for walls", int),
         ("bank_scroll_duration_ms", "List swipe duration (ms)", int),
         ("bank_scroll_delay", "Pause after swipe (s)", float),
         ("bank_post_spend_delay", "Pause after purchase (s)", float),
@@ -866,6 +868,14 @@ TOP_BAR = {"lab": ((662, 61), (680, 30, 820, 95), (600, 20, 680, 105)),
            "bb_builder": ((1040, 60), (1080, 30, 1185, 95), (990, 20, 1075, 105))}
 KIND_NAMES = {"builder": "Builder", "lab": "Lab", "bb_builder": "Builder Base builder", "bb_lab": "Star Lab"}
 BB_STARS = (95, 866, 200, 910)  # the 'x/y' daily star counter on the Builder Base Attack button
+
+
+def wall_reserve_of(cfg):
+    """Gold/elixir kept back from wall upgrades (never spent on walls). 0 if unset or garbled."""
+    try:
+        return max(0, int(cfg.get("wall_reserve") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def top_bar(frame, kind):
@@ -1427,6 +1437,12 @@ class Bot:
                     if state is None:
                         unknown_since = unknown_since or time.time()
                         stuck = time.time() - unknown_since
+                        if time.time() - getattr(self, "_unknown_saved", 0) > 60:
+                            self._unknown_saved = time.time()  # keep the screen we can't read (once a minute)
+                            try:
+                                cv2.imwrite(os.path.join(BASE_DIR, "debug_unknown.png"), frame)
+                            except Exception as e:
+                                log_file.info(f"debug_unknown.png: {e}")
                         # the Supercell logo / loading clouds after a (re)start aren't 'stuck': a slow PC can take
                         # minutes there, and relaunching mid-load would just loop
                         loading = time.time() - getattr(self, "_launched_at", 0) < 180
@@ -1560,14 +1576,16 @@ class Bot:
                 raise Abort()
             # No wall rows in the planner scan (first run, or the game's data export didn't come through)? Try
             # anyway: buy_wall reads the real price off the Upgrade More bar and only buys what we can afford.
-            if self.spend_bank(storage, 0 if price is None else price):
+            # The reserve is kept back, so walls can never leave the bot too poor to find and fight a battle.
+            reserve = wall_reserve_of(self.cfg)
+            if self.spend_bank(storage, reserve + (price or 0)):
                 return
             if time.time() - getattr(self, "_wall_note_t", 0) > 60:
                 self._wall_note_t = time.time()
                 have = "  ".join(f"{k} {v:,}" if v is not None else f"{k} ?" for k, v in
                                  (("gold", storage.get("gold")), ("elixir", storage.get("elixir"))))
-                self.log(f"Walls: next upgrade costs {price:,} - {have} left, going looting." if price else
-                         f"Walls: {have} left, nothing affordable - going looting.")
+                self.log(f"Walls: {have} - keeping {reserve:,} back, going looting."
+                         + (f" Next upgrade: {price:,}." if price else ""))
             return self.attack_now()
         for kind in ("builder", "lab"):
             if self.cfg[f"{kind}_upgrades_enabled"] and time.time() >= self._upgrade_backoff.get(kind, 0):
@@ -1918,9 +1936,12 @@ class Bot:
         """Buy walls with what the storages hold. `threshold` is the price of the next wall upgrade (0 = try
         whatever we have: buy_wall reads the real price in the game and only buys what is affordable). Without a
         threshold the Settings value is used, which is what the farm mode's 'buy walls when storage is full'
-        does. Returns True only when a wall was really bought, so the caller can go looting when it wasn't.
-        Walls do not use a builder in Clash of Clans, so a busy builder list is never a reason to skip them."""
+        does. `wall_reserve` is always kept back, so walls can never drain the bank to nothing - that is what
+        stops the bot from being unable to find or fight a battle. Returns True only when a wall was really
+        bought, so the caller can go looting when it wasn't. Walls do not use a builder in Clash of Clans, so a
+        busy builder list is never a reason to skip them."""
         thr = self.cfg["bank_spend_threshold"] if threshold is None else threshold
+        reserve = wall_reserve_of(self.cfg)
         if not any((storage.get(c) or 0) >= thr for c in ("gold", "elixir")):
             return False
         did = False
@@ -1930,12 +1951,15 @@ class Bot:
                 continue
             if time.time() < self._bank_backoff.get(cur, 0):
                 continue
+            cap = val - reserve  # walls may only use what is above the reserve
+            if cap <= 0:
+                continue
             self.sleep(0.5)
             again = white_number(self.shot(), self.cfg["ocr_regions"].get(f"bank_{cur}_region") or (0, 0, 1, 1))
             if again != val:  # a one-off misread (e.g. 1.7M read as 17M) must never trigger a purchase
                 self.log(f"{cur.title()} read {val:,} then {again} - not sure, skipping this time.", "warn")
                 continue
-            if self.buy_wall(cur, val):
+            if self.buy_wall(cur, val, cap):
                 self.walls_progress(getattr(self, "_wall_paid", 0))
                 did = True
             else:
@@ -2048,13 +2072,16 @@ class Bot:
                 return hit
             self.sleep(0.5)
 
-    def buy_wall(self, cur, balance=None):
+    def buy_wall(self, cur, balance=None, cap=None):
         """Builder list -> 'Wall' row (selects a wall) -> close list -> Upgrade More -> Upgrade in `cur`
-        -> Okay, but only if the dialog really says it upgrades Walls for `cur` (never gems)."""
+        -> Okay, but only if the dialog really says it upgrades Walls for `cur` (never gems).
+        `cap` (default: the whole balance) is what may be spent - the reserve is already taken off it; `balance`
+        stays the full storage reading so the 'did the balance drop' check below is measured against reality."""
         region = self.cfg["ocr_regions"].get(f"bank_{cur}_region")
         frame = self.shot()
         if balance is None and region:
             balance = white_number(frame, region)
+        cap = balance if cap is None else cap
         for attempt in range(3):  # a slid list can land the tap on the wrong building: just try again
             # always a fresh pick from the list: a bar left from the last purchase holds walls a level higher now
             more = self.select_wall()
@@ -2074,8 +2101,9 @@ class Bot:
             want = white_number(f, (bx - int(100 * k), more[1] - int(134 * k), bx + int(60 * k), more[1] - int(89 * k)))
             if not want:
                 return self.wall_fail("single wall: couldn't read its price (can't afford it?)", f)
-            if balance is not None and want > balance:
-                return self.wall_fail(f"single wall costs {want:,} but storage is {balance:,} - not buying", f)
+            if cap is not None and want > cap:
+                return self.wall_fail(f"single wall costs {want:,} but only {cap:,} is available above the "
+                                      f"reserve - not buying", f)
             self.log(f"Only one wall at this level - upgrading it on its own ({want:,} {cur}).")
             self.tap((bx, more[1] - int(40 * k)), 1.5)
         else:
@@ -2093,8 +2121,8 @@ class Bot:
             for _ in range(20):  # Upgrade More selects a whole row: drop walls (-1) until it's affordable
                 f = self.shot()
                 cost = self.bar_price(f, btn)
-                if cost is None or balance is None or cost <= balance:
-                    break
+                if cost is None or cap is None or cost <= cap:
+                    break  # drop walls off the selection until it fits above the reserve
                 k = f.shape[1] / 1920  # bar layout is fixed: Remove Wall, Add +10, Add +1, gold Upgrade, elixir Upgrade
                 self.tap((pair[0][0] - int(612 * k), pair[0][1] + int(12 * k)), 0.7)
             self.tap(btn, 1.2)
@@ -2116,8 +2144,9 @@ class Bot:
             if not ok or not want or shown != want:
                 return self.wall_fail(f"upgrade window didn't check out (price {shown} vs {want})", self.shot())
             price = want
-        if balance is not None and price > balance:
-            return self.wall_fail(f"costs {price:,} but storage is {balance:,} - not buying", frame)
+        if cap is not None and price > cap:
+            return self.wall_fail(f"costs {price:,} but only {cap:,} is available above the reserve - not buying",
+                                  frame)
         self.tap(ok, self.cfg["bank_post_spend_delay"])
         after = white_number(self.shot(), region) if region else None
         if balance is not None and after is not None and after > balance - price * 0.9:
@@ -5090,7 +5119,7 @@ class App(tk.Tk):
                     files.append(("bot.log", hide.sub("k=<hidden>", "".join(f.readlines()[-400:])).encode()))
             except OSError:
                 pass
-            for name in ("debug_deploy.png", "debug_wall.png", "debug_boat.png"):
+            for name in ("debug_deploy.png", "debug_wall.png", "debug_boat.png", "debug_unknown.png"):
                 path = os.path.join(BASE_DIR, name)
                 if os.path.exists(path) and time.time() - os.path.getmtime(path) < 6 * 3600:
                     img = cv2.imread(path)

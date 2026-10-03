@@ -81,6 +81,12 @@ first. All session long it repeats this:
   2. Only then go looting, attacking and skipping bases by the same loot rules as usual.
   3. Come home with more loot, spend it on walls again, then loot again.
 
+It always keeps a reserve back: "Keep in storage for walls" (Settings > Upgrades,
+3,000,000 by default) is never spent on walls, so the bank can't be drained so low that
+the bot can't find or fight a battle. With a reserve of 3M and a 4M next upgrade it buys
+walls while there is 7M or more and goes looting below that - exactly the "stop at 3M"
+moment. Set the reserve to 0 if you really want every last coin spent on walls.
+
 Walls never need a builder in Clash of Clans, so busy builders don't stop it. It ignores
 the "Spend when storage >=" setting (that one is for normal farming, where walls use only
 the storage above the threshold). If a purchase fails for a currency it waits 5 minutes
