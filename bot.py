@@ -1480,6 +1480,12 @@ class Bot:
                     if state is None:
                         unknown_since = unknown_since or time.time()
                         stuck = time.time() - unknown_since
+                        if time.time() - getattr(self, "_unknown_saved", 0) > 60:
+                            self._unknown_saved = time.time()  # keep the screen we can't read (once a minute)
+                            try:
+                                cv2.imwrite(os.path.join(BASE_DIR, "debug_unknown.png"), frame)
+                            except Exception as e:
+                                log_file.info(f"debug_unknown.png: {e}")
                         # the Supercell logo / loading clouds after a (re)start aren't 'stuck': a slow PC can take
                         # minutes there, and relaunching mid-load would just loop
                         loading = time.time() - getattr(self, "_launched_at", 0) < 180
@@ -1491,9 +1497,20 @@ class Bot:
                         elif self.bb_bonus(self._last_name or "?"):  # the Star Bonus popup (home or Builder
                             unknown_since = None                     # Base) - known, so no need to ask Groq
                         elif self.find(frame, "wall_okay_button"):
-                            self.log("Closing an Okay/Cancel dialog with Back (never confirms).")
-                            self.adb.back()
-                            self.sleep(1.0)
+                            # Back is the safe dismissal (it can never confirm a purchase), but if it isn't
+                            # clearing the dialog - or the template is matching something that isn't a dialog -
+                            # pressing it forever is what stalls the bot. Cap it and recover properly instead.
+                            self._dlg_backs = getattr(self, "_dlg_backs", 0) + 1
+                            if self._dlg_backs > 3:
+                                self._dlg_backs = 0
+                                self.log("The Okay/Cancel dialog is still there after 3 Backs - restarting the "
+                                         "game instead of pressing Back forever.", "err")
+                                self.recover_game("an Okay/Cancel dialog that Back won't close")
+                                unknown_since, backs = None, 0
+                            else:
+                                self.log("Closing an Okay/Cancel dialog with Back (never confirms).")
+                                self.adb.back()
+                                self.sleep(1.0)
                         elif (self.groq_on("groq_supervisor") and stuck >= 2.5 and time.time() - self._last_groq >= 5
                               and (state := self.groq_rescue(frame))):
                             unknown_since = None
@@ -1507,6 +1524,7 @@ class Bot:
                         self.sleep(1.0)
                     else:
                         unknown_since, backs = None, 0
+                        self._dlg_backs = 0
                         getattr(self, "on_" + state.lower())(frame, prev)
                     prev = state
                 except ADBError as e:
