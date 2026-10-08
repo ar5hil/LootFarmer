@@ -207,6 +207,13 @@ POINTS = [
     ("deploy_line_end", "Troop line end (same side of the base)"),
     ("spell_point", "Spell line start (optional)"),
     ("spell_line_end", "Spell line end (optional)"),
+    ("bb_deploy_1", "Builder Base troop 1 drop point"),
+    ("bb_deploy_2", "Builder Base troop 2 drop point"),
+    ("bb_deploy_3", "Builder Base troop 3 drop point"),
+    ("bb_deploy_4", "Builder Base troop 4 drop point"),
+    ("bb_deploy_5", "Builder Base troop 5 drop point"),
+    ("bb_deploy_6", "Builder Base troop 6 drop point"),
+    ("bb_deploy_hero", "Builder Base hero drop point"),
 ]
 # Checked in this order; first template above the confidence wins. Overlays
 # and more specific screens come before the screens they sit on top of
@@ -264,6 +271,7 @@ DEFAULTS = {
     "lab_upgrades_enabled": False,
     "builder_base_enabled": False,  # visit the Builder Base on every account: collect, cart, upgrades, daily stars
     "bb_visit_hours": 3,
+    "bb_battle_max_wait": 30,
     "bb_attacks_enabled": True,
     "bb_builder_upgrades": True,
     "bb_lab_upgrades": True,
@@ -346,6 +354,7 @@ SETTINGS = [
         ("bb_builder_upgrades", "Builders: upgrade buildings / Battle Machine", bool),
         ("bb_lab_upgrades", "Star Lab: research", bool),
         ("bb_visit_hours", "Revisit each account every (h)", float),
+        ("bb_battle_max_wait", "Attack duration after first deployment (s)", float),
     ]),
     ("Accounts", "When every enabled builder + lab slot is busy (and walls are spent), switch to the next "
                  "Supercell ID account. All busy everywhere = keep farming here and re-check in 30 min.", [
@@ -947,7 +956,7 @@ def troop_bar(frame):
         if a <= end:
             continue
         inside = bar_hsv[:, a + 5:a + 12]
-        if inside[:, :, 1].mean() > 100 and inside[:, :, 2].mean() < 110:
+        if inside[:, :, 1].mean() > 100 and inside[:, :, 2].mean() < 80:
             continue  # dark blue bar background, not a card (e.g. a selected card's thick border)
         b = next((p for p in peaks if cw - 6 <= p - a <= cw + 16), None)  # +16: a selected card's white border
         if b:
@@ -958,14 +967,16 @@ def troop_bar(frame):
     def number(y0, y1, x0, x1, min_h):
         """White digits in this box (e.g. the 'x16' count, or the level badge), or None."""
         cc = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
-        cm = ((cc[:, :, 2] > 200) & (cc[:, :, 1] < 60)).astype(np.uint8)
+        # BlueStacks Air's captured whites peak around 175, while Windows templates reach 255. Use a local
+        # brightness threshold so troop counts stay readable on both renderers.
+        cm = ((cc[:, :, 2] > max(120, int(cc[:, :, 2].max() * 0.78))) & (cc[:, :, 1] < 100)).astype(np.uint8)
         n, lab, st, _ = cv2.connectedComponentsWithStats(cm, 8)
         digits = ""
         for i in sorted((i for i in range(1, n) if st[i, 3] >= min_h), key=lambda i: st[i, 0]):
             x, y, w, h = st[i, :4]
             gl = cv2.resize((lab[y:y + h, x:x + w] == i).astype(np.float32), (20, 28), interpolation=cv2.INTER_AREA)
             dist = [float(np.abs(gl - glyphs[k]).mean()) for k in range(10)]
-            if min(dist) <= 0.15:
+            if min(dist) <= (0.24 if IS_MAC else 0.15):
                 digits += str(dist.index(min(dist)))
             elif digits:
                 break
@@ -976,7 +987,7 @@ def troop_bar(frame):
         count, so just look for a digit-sized white blob on dark). A dashed empty slot showing the base doesn't."""
         x0, y0 = a + 2, int(H * 0.91)
         cc = cv2.cvtColor(frame[y0:int(H * 0.985), x0:a + (b - a) // 2], cv2.COLOR_BGR2HSV)
-        white = ((cc[:, :, 2] > 200) & (cc[:, :, 1] < 60)).astype(np.uint8)
+        white = ((cc[:, :, 2] > max(120, int(cc[:, :, 2].max() * 0.78))) & (cc[:, :, 1] < 100)).astype(np.uint8)
         n, _, st, _ = cv2.connectedComponentsWithStats(white, 8)
         for i in range(1, n):
             x, y, w, h = st[i, :4]
@@ -991,7 +1002,7 @@ def troop_bar(frame):
         hsv = cv2.cvtColor(frame[ya:yb, a + 4:b - 4], cv2.COLOR_BGR2HSV)
         hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
         colored = (sat > 90) & (val > 90) & ~((hue >= 30) & (hue <= 85))  # any card colour, not grass
-        grey = (sat < 40) & (val > 60)
+        grey = (sat < 40) & (val > (30 if IS_MAC else 60))
         cnt = number(top, top + 50, a + (b - a) // 3, b - 4, 18)  # 'x16' at the top-right, after the 'x'
         if cnt is None:  # a selected card sits ~15px higher
             cnt = number(top - int(H * 0.017), top + 35, a + (b - a) // 3, b - 4, 18)
@@ -1721,7 +1732,7 @@ class Bot:
 
     def start_view(self):
         """Zoom fully out + pan to the drop corner in the background while the loot is read, so the deploy can
-        start straight away (it took ~6 s at deploy time). The adb shell is locked: a Next tap simply waits."""
+            start straight away (it took ~6 s at deploy time). The adb shell is locked: a Next tap simply waits."""
         if self._view is None and self.cfg.get("deploy_pan", "off") in PAN_DIRS:
             def work():
                 try:
@@ -1732,6 +1743,28 @@ class Bot:
             self._view = threading.Thread(target=work, daemon=True)
             self._view.start()
 
+    def wait_for_battle_start(self, timeout=45):
+        """A good base is still only a scouting screen until its countdown ends; dropping troops early is ignored.
+        Wait for Next to disappear across several frames before allowing the deployment routine to tap the army."""
+        end, absent = time.time() + timeout, 0
+        while time.time() < end:
+            frame = self.shot()
+            if self.find(frame, "surrender_button") and not self.find(frame, "next_button"):
+                absent += 1
+                if absent >= 3:
+                    return True
+            else:
+                absent = 0
+            self.sleep(0.35)
+        return False
+
+    def attack_from_scout(self, gold, elixir):
+        if not self.wait_for_battle_start():
+            self.log("Battle countdown didn't finish within 45 seconds - waiting for the next screen before deploying.",
+                     "warn")
+            return False
+        return self.attack(gold, elixir)
+
     def on_scout(self, frame, prev):
         c = self.cfg
         if self.mode.startswith("bb_"):  # Builder Base only: leave a home search (End Battle before deploying is free)
@@ -1739,7 +1772,7 @@ class Bot:
             return self.tap(hit, 3.0) if hit else self.back_to_village()
         self.start_view()
         if c["loot_force_attack"]:
-            return self.attack(None, None)
+            return self.attack_from_scout(None, None)
         if prev != "SCOUT":  # loot numbers count up as the base loads
             self.sleep(c["loot_settle_delay"])
             frame = self.shot()
@@ -1756,13 +1789,13 @@ class Bot:
                 self.log("Can't read loot on 5 bases in a row - attacking anyway so Next doesn't burn "
                          "gold. Re-capture the loot regions in Setup.", "warn")
                 self._unreadable = 0
-                return self.attack(gold, elixir)
+                return self.attack_from_scout(gold, elixir)
             self.log(f"Loot unreadable (gold={gold}, elixir={elixir}) - next base.", "warn")
         else:
             self._unreadable = 0
             g_ok, e_ok = gold >= c["loot_gold_threshold"], elixir >= c["loot_elixir_threshold"]
             if (g_ok and e_ok) if c["loot_require_both"] else (g_ok or e_ok):
-                return self.attack(gold, elixir)
+                return self.attack_from_scout(gold, elixir)
             self.log(f"Skip: gold {gold:,} / elixir {elixir:,}")
         hit = self.find(self.shot(), "next_button") or self.hits.get("next_button")
         if hit:
@@ -2476,12 +2509,19 @@ class Bot:
             cards = [c for c in troop_bar(self.shot()) if c[2] in ("hero", "single", "troop")]
         if not cards:
             return self.log("Builder Base: no battle screen after Find Now.", "warn")
+        # Builder Base exposes the troop bar before the playable battlefield is ready.
+        # Let the intro finish, zoom fully out, then pan the camera toward the right edge.
+        self.sleep(4.5)
+        zoom_out(self.adb)
+        pan_view(self.adb, "right")
+        self.sleep(0.6)
         self.bump("attacks")
+        self._bb_first_deploy = None
         self.bb_deploy(cards)
         self.log(f"Builder Base: attacking with {len(cards)} cards.", "ok")
-        end = time.time() + 420  # up to two stages of 3 min each
+        end = (self._bb_first_deploy or time.time()) + max(1, float(self.cfg.get("bb_battle_max_wait", 30)))
         while time.time() < end:  # the battle ends by itself once every troop is down (or the timer runs out)
-            self.sleep(6)
+            self.sleep(min(6, max(0.1, end - time.time())))
             f = self.shot()
             done = self.find(f, "bb_return_home")
             if done:
@@ -2496,14 +2536,32 @@ class Bot:
             # 100% on stage 1 starts stage 2 with extra cards (+ the survivors): drop everything not used up.
             # Tapping an already-deployed card is harmless (the Battle Machine's = its ability).
             self.bb_deploy([c for c in troop_bar(f) if c[2] in ("hero", "single", "troop")])
-        self.log("Builder Base: battle didn't finish in time.", "warn")
+        self.log(f"Builder Base: {self.cfg.get('bb_battle_max_wait', 30):.0f}s since first deployment - ending battle.")
+        for name in ("surrender_button", "surrender_confirm_button"):
+            hit = self.wait_for(name, 6) or self.cfg["coords"].get(name)
+            if not hit:
+                self.log(f"Builder Base: couldn't find '{name}' to surrender.", "warn")
+                return None
+            self.tap(hit, 0.8)
 
     def bb_deploy(self, cards):
-        a, b = (390, 380), (260, 600)  # left edge of the map: always outside the base, clear of the Boost buttons
+        a, b = (390, 380), (260, 600)  # fallback at the map edge, clear of the Boost buttons
+        troop_slot = 0
         for k, (x, y, kind, n) in enumerate(cards):
             self.tap((x, y), self.speed()[1])
+            if kind == "hero":
+                target = self.cfg["fixed_points"].get("bb_deploy_hero")
+            else:
+                troop_slot += 1
+                target = self.cfg["fixed_points"].get(f"bb_deploy_{troop_slot}")
+            if target:
+                a = b = tuple(target)
+            else:
+                a, b = (390, 380), (260, 600)
+            if self._bb_first_deploy is None:
+                self._bb_first_deploy = time.time()
             for i in range(n or 1):
-                self.adb.tap(*self.along(a, b, (k + i) % len(cards), len(cards)))
+                self.adb.tap(*(a if a == b else self.along(a, b, (k + i) % len(cards), len(cards))))
             self.sleep(0.2)
 
     def builder_base(self):
@@ -4268,7 +4326,10 @@ def zoom_out(adb, times=3, W=1920, H=1080, spread=((460, 900), (1460, 1020))):
 def fast_taps(adb, pts, gap=0.0, W=1920, H=1080):
     """Taps as raw touch events written straight to the touch device - the device opened once, each tap held
     20 ms (with no hold the game drops some). ~0.05 s a tap instead of ~0.19 s for `input tap`, which starts a
-    Java process every time. False if there's no touch device (the caller falls back to `input tap`)."""
+    Java process every time. False on macOS because BlueStacks Air can accept these writes without delivering
+    them to the game; the caller then uses Android's `input tap` command, which the game reliably receives."""
+    if IS_MAC:
+        return False
     d = touch_device(adb)
     if not d or not pts:
         return False
@@ -4429,6 +4490,64 @@ class DropLinePicker(tk.Toplevel):
             fp.pop(self.keys[1], None)
         save_config(self.app.cfg)
         self.app.log(f"{self.what} drop line saved: {tuple(a)} -> {tuple(b) if b else 'single spot'}.", "ok")
+        self.app.refresh_setup()
+        self.destroy()
+
+
+class BuilderDropPicker(DropLinePicker):
+    """Capture one battlefield drop location for each Builder Base card and Battle Machine."""
+
+    def __init__(self, app, frame):
+        keys = tuple(f"bb_deploy_{i}" for i in range(1, 7)) + ("bb_deploy_hero",)
+        super().__init__(app, frame, keys=keys, what="Builder Base")
+        self.title("Builder Base drop points")
+        self.pts = [list(app.cfg["fixed_points"][k]) if app.cfg["fixed_points"].get(k) else None for k in keys]
+        self.draw()
+
+    def draw(self):
+        self.cv.delete("all")
+        self.cv.create_image(0, 0, anchor="nw", image=self.photo)
+        for i, p in enumerate(self.pts):
+            if not p:
+                continue
+            x, y = p[0] * self.scale, p[1] * self.scale
+            color = "#d77bff" if i == 6 else "#ffd21f"
+            r = S(11)
+            self.cv.create_oval(x-r, y-r, x+r, y+r, outline="white", width=S(3), fill=color)
+            self.cv.create_text(x+r+6, y-r-6, text="Hero" if i == 6 else str(i+1),
+                                fill="white", anchor="w", font=(UI_FONT, 12, "bold"))
+        next_slot = next((i for i, p in enumerate(self.pts) if p is None), None)
+        prompt = ("Click battlefield location for " + ("Hero" if next_slot == 6 else f"troop {next_slot+1}")
+                  if next_slot is not None else "All seven locations set — click a marker to move it.")
+        self.info.config(text=prompt)
+
+    def click(self, e):
+        p = [int(e.x / self.scale), int(e.y / self.scale)]
+        missing = next((i for i, point in enumerate(self.pts) if point is None), None)
+        if missing is not None:
+            self.pts[missing] = p
+        else:
+            near = min(range(len(self.pts)), key=lambda i: (self.pts[i][0]-p[0])**2 + (self.pts[i][1]-p[1])**2)
+            self.pts[near] = p
+        self.draw()
+
+    def clear(self):
+        self.pts = [None] * 7
+        self.draw()
+
+    def pan(self):
+        self.app.bg(lambda: (zoom_out(self.app.adb), pan_view(self.app.adb, "right"), time.sleep(0.6),
+                             self.app.ui(self.refresh)))
+
+    def save(self):
+        fp = self.app.cfg["fixed_points"]
+        for key, point in zip(self.keys, self.pts):
+            if point:
+                fp[key] = point
+            else:
+                fp.pop(key, None)
+        save_config(self.app.cfg)
+        self.app.log("Builder Base drop points saved.", "ok")
         self.app.refresh_setup()
         self.destroy()
 
@@ -5243,6 +5362,7 @@ class App(tk.Tk):
         menu = tk.Menu(tools, tearoff=False)
         for label, cmd in (("Preview the emulator screen", self.preview_screen),
                            ("Read the troop bar (start a search first)", self.read_bar),
+                           ("Test: Builder Base zoom out + pan right", self.test_bb_zoomout),
                            ("Test: builder upgrade", lambda: self.test_upgrade("builder")),
                            ("Test: lab research", lambda: self.test_upgrade("lab")),
                            ("Test: buy a wall with gold", lambda: self.test_wall("gold")),
@@ -5291,6 +5411,42 @@ class App(tk.Tk):
                    command=lambda: self.with_screenshot(lambda f: DropLinePicker(self, f))).pack(side="left", padx=S(8))
         ttk.Button(row, text="Set spell line", command=lambda: self.with_screenshot(lambda f: DropLinePicker(
             self, f, ("spell_point", "spell_line_end"), "Spell"))).pack(side="left")
+        ttk.Button(row, text="Set Builder Base drop points", command=lambda: self.with_screenshot(
+            lambda f: BuilderDropPicker(self, f))).pack(side="left", padx=S(8))
+
+    def test_bb_zoomout(self):
+        """Start a Builder Base matchmaking test, then zoom out and pan right on the loaded battlefield."""
+        if self.thread:
+            return messagebox.showinfo("Farming is running", "Stop farming first, then test.")
+
+        def work():
+            bot = Bot(self.cfg, self.adb, self.emit, "bb_loot")
+            attack = bot.find(bot.shot(), "bb_attack_button")
+            if not attack:
+                return self.log("Open Builder Base and leave it on the home screen before running this test.", "warn")
+            find = None
+            for _ in range(2):
+                bot.tap(bot.find(bot.shot(), "bb_attack_button") or attack, 1.5)
+                find = bot.wait_for("bb_find_now", 5)
+                if find:
+                    break
+            if not find:
+                return self.log("Builder Base test: Find Now didn't appear.", "warn")
+            bot.tap(find, 1)
+            end = time.time() + 60
+            while time.time() < end:
+                frame = self.adb.screenshot()
+                if troop_bar(frame):
+                    time.sleep(4.5)
+                    zoom_out(self.adb)
+                    pan_view(self.adb, "right")
+                    time.sleep(0.6)
+                    self.log("Builder Base test ready: zoomed out and panned right. Set the troop/hero points on this view.", "ok")
+                    self.ui(lambda f= self.adb.screenshot(): BuilderDropPicker(self, f))
+                    return
+                time.sleep(1)
+            self.log("Builder Base test: battlefield troop bar didn't appear within 60 seconds.", "warn")
+        self.bg(work)
 
 
     def _scroll_area(self, parent):
