@@ -274,6 +274,7 @@ DEFAULTS = {
     "bb_battle_max_wait": 30,
     "bb_attacks_enabled": True,
     "bb_builder_upgrades": True,
+    "bb_walls_enabled": False,
     "bb_lab_upgrades": True,
     "bb_bonus_days": {},  # account -> date its daily Star Bonus was collected (no more attacks that day)
     "bank_spend_threshold": 15000000,
@@ -347,11 +348,13 @@ SETTINGS = [
         ("bank_scroll_delay", "Pause after swipe (s)", float),
         ("bank_post_spend_delay", "Pause after purchase (s)", float),
     ]),
-    ("Builder Base", "Each account gets a visit by boat: collect the collectors and the Elixir Cart, then the "
-                     "switches below. Same on/off as the dashboard's Builder Base switch.", [
+    ("Builder Base", "Each account gets a visit by boat. Wall focus reserves a Builder and limits ordinary "
+                     "Builder Base building upgrades to one at a time; once walls are maxed, normal builder "
+                     "upgrades resume.", [
         ("builder_base_enabled", "Visit the Builder Base", bool),
         ("bb_attacks_enabled", "Attack until the daily Star Bonus", bool),
         ("bb_builder_upgrades", "Builders: upgrade buildings / Battle Machine", bool),
+        ("bb_walls_enabled", "Prioritize Builder Base walls (keep a builder free; max 1 building upgrade)", bool),
         ("bb_lab_upgrades", "Star Lab: research", bool),
         ("bb_visit_hours", "Revisit each account every (h)", float),
         ("bb_battle_max_wait", "Attack duration after first deployment (s)", float),
@@ -2603,10 +2606,30 @@ class Bot:
             self._upgrade_backoff.pop("bb_lab", None)
 
     def bb_upgrades(self):
-        """Keep the Builder Base builders + Star Lab busy: the next target in this account's plan (or wait for it),
-        else the most expensive thing affordable. True if any builder / the Star Lab is still free afterwards."""
+        """Keep Builder Base upgrades moving, optionally reserving a builder for wall upgrades."""
         free, self._bb_saving = False, None
-        for kind in ("bb_builder", "bb_lab"):
+        wall_focus = bool(self.cfg.get("bb_walls_enabled"))
+        if wall_focus:
+            self._bb_wall_found = False
+            self.upgrade_from_list("bb_builder", wall_only=True)
+            if self._bb_wall_found:
+                frame = self.shot()
+                free_count = self.free_slots(frame, "bb_builder") or 0
+                counter = read_counter(frame, top_bar(frame, "bb_builder")[1])
+                total = counter[1] if counter else free_count
+                active = max(0, total - free_count)
+                if self.cfg.get("bb_builder_upgrades") and free_count >= 2 and active == 0:
+                    # Keep a Builder unassigned for walls and run no more than one building upgrade at a time.
+                    before = self.stats["upgrades"]
+                    self.upgrade_from_list("bb_builder")
+                    if self.stats["upgrades"] == before:
+                        free = True
+                elif free_count:
+                    free = True
+                else:
+                    self.log("Builder Base walls remain; waiting for a free Builder before spending on them.")
+        kinds = ("bb_lab",) if wall_focus and self._bb_wall_found else ("bb_builder", "bb_lab")
+        for kind in kinds:
             if not self.cfg["bb_builder_upgrades" if kind == "bb_builder" else "bb_lab_upgrades"]:
                 continue
             if kind == "bb_lab" and self._bb_saving == "elixir":
@@ -2775,9 +2798,9 @@ class Bot:
         self.adb.swipe(cx, y1 - 90, cx, max(y0 + 90, y1 - 90 - 380), self.cfg["bank_scroll_duration_ms"])
         self.sleep(self.cfg["bank_scroll_delay"])
 
-    def upgrade_from_list(self, kind):
-        """Open the builder or lab list, read every row, start the MOST EXPENSIVE upgrade you can afford
-        (white price; walls are left to the wall routine), and confirm with the green resource button only.
+    def upgrade_from_list(self, kind, wall_only=False):
+        """Open a builder or lab list, then confirm only a row whose green resource button matches its listed price.
+        BB wall-only scans select an affordable wall row; the home village continues to use its dedicated wall path.
         Busy builders/lab just produce a gem prompt, which is backed out of - so the attempt is the check."""
         frame = self.shot()
         icon = top_bar(frame, kind)[0]
@@ -2790,7 +2813,7 @@ class Bot:
         # Only refuse when the top bar agrees (goblin face / 0 free): one read of a still-moving list isn't enough.
         if kind.startswith("bb_") and free_before:
             normal = free_before  # the Builder Base list has no 'Available!' rows: trust the top bar counter
-        if normal == 0 and not free_before:  # nothing free, or only the goblin (it costs gems) - never use it
+        if normal == 0 and not free_before and not wall_only:  # nothing free, or only the goblin (it costs gems)
             self._busy_until[kind] = self._upgrade_backoff[kind] = time.time() + 1800
             self.back_to_village(icon)
             return self.log(f"{KIND_NAMES[kind]}: " + ("only the goblin is free (costs gems) - not using it"
@@ -2798,7 +2821,21 @@ class Bot:
         if kind == "builder":
             self._saving_home = None
         seen = self.read_list()  # the whole list first: the discount and levels are worked out from all of it
-        plan, levels = self.plan_positions(kind, seen)
+        if wall_only:
+            walls = [r for r in seen if is_wall(r[0])]
+            self._bb_wall_found = bool(walls)
+            if not walls:
+                self.back_to_village(icon)
+                self.log("Builder Base walls: none remain - resuming normal Builder Base upgrades.", "ok")
+                return
+            seen = walls
+            if not free_before:
+                self.back_to_village(icon)
+                self.log("Builder Base walls remain, but no Builder is free yet.")
+                return
+            plan, levels = {}, {}
+        else:
+            plan, levels = self.plan_positions(kind, seen)
         other = None  # saving up for the plan's next target: the resource it does NOT need (spare builders use it)
         if plan:  # this account has a plan: stick to it - the next target in order, or wait (keep farming) for it
             i = min(plan.values())
@@ -2822,11 +2859,12 @@ class Bot:
                                 + (" (Builder Base visits wait till then)." if kind == "builder" else "."))
         best = None
         for nm, price, ok in seen:
-            skip = is_wall(nm) or (  # walls: the wall routine; TH: optional no-rush
+            skip = (is_wall(nm) and not wall_only) or (  # walls: the dedicated path; TH: optional no-rush
                 self.cfg.get("skip_town_hall", True) and re.search(r"t[o0]wn\s*ha", nm.lower()))
             if skip or not ok or levels.get((nm, price)) == 0 or nm.lower().startswith("new "):
                 continue  # 'New ...' rows build a new one: that's placing it from the shop, not an upgrade
-            if kind.endswith("builder") and wiki_key(nm, "builder" if kind.startswith("bb_") else "home") is None \
+            if kind.endswith("builder") and not (wall_only and is_wall(nm)) \
+                    and wiki_key(nm, "builder" if kind.startswith("bb_") else "home") is None \
                     and norm_name(nm) not in NO_WIKI:
                 continue  # event Crafting Station defenses (Hot Candle, Cake-A-Pult...): a 3-way stat window
             if plan and other is not None:  # saving up: only things paid in the other resource
