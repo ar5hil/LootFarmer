@@ -674,12 +674,15 @@ class Vision:
 
     def undimmed(self, frame, name, hit):
         """Template matching ignores brightness, so a button under a popup's dark overlay still 'matches'.
-        Clean screens measure 0.97-1.0 of the template's brightness, overlaid ones 0.3-0.5."""
+        Clean screens measure 0.97-1.0 of the template's brightness on BlueStacks 5, overlaid ones 0.3-0.5.
+        BlueStacks Air renders the same home button at about 0.72 brightness, so use a lower Mac cutoff while
+        keeping enough separation from a dimmed button."""
         t = self.template(name)
         h, w = t[1]
         x, y = hit[0] - w // 2, hit[1] - h // 2
         patch = frame[max(0, y):y + h, max(0, x):x + w]
-        return patch.size > 0 and patch.mean() >= 0.8 * t[2].mean()
+        cutoff = 0.65 if IS_MAC else 0.8
+        return patch.size > 0 and patch.mean() >= cutoff * t[2].mean()
 
 
 def crop(frame, bbox, pad=0):
