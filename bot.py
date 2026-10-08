@@ -36,6 +36,7 @@ import base64
 import collections
 import ctypes
 import difflib
+import glob
 import hashlib
 import http.server
 import json
@@ -72,17 +73,86 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 19  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 32  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
-# Shipped inside the bot folder so nothing needs installing (used when the configured path doesn't exist)
-BUNDLED = {"adb_path": os.path.join(BASE_DIR, "platform-tools", "adb.exe"),
-           "tesseract_path": os.path.join(BASE_DIR, "Tesseract-OCR", "tesseract.exe")}
+# ---------------------------------------------------------------------------
+# Platform: Windows = BlueStacks 5, macOS = BlueStacks Air (Apple silicon).
+# Every platform decision lives here; the rest of the bot is shared code.
+# ---------------------------------------------------------------------------
+IS_WIN = os.name == "nt"
+IS_MAC = sys.platform == "darwin"
+BS_APP_MAC = "/Applications/BlueStacks.app"
+BS_CONF_MAC = "/Users/Shared/Library/Application Support/BlueStacks/bluestacks.conf"
+
+
+def _first_path(*paths):
+    """The first of these that exists on this machine, or ""."""
+    for p in paths:
+        if p and os.path.exists(p):
+            return p
+    return ""
+
+
+def cf_exe():
+    """cloudflared next to bot.py on Windows, or the Homebrew/plain binary on macOS."""
+    local = os.path.join(BASE_DIR, "cloudflared.exe")
+    if IS_WIN:
+        return local
+    return _first_path(local, shutil.which("cloudflared") or "", "/opt/homebrew/bin/cloudflared",
+                       "/usr/local/bin/cloudflared")
+
+
+if IS_MAC:
+    # BlueStacks Air ships its own adb (hd-adb): using it keeps client and server in step. Homebrew
+    # (brew install android-platform-tools) or Google's platform-tools work just as well.
+    BUNDLED = {"adb_path": _first_path(os.path.join(BS_APP_MAC, "Contents", "MacOS", "hd-adb"),
+                                       shutil.which("adb") or "", "/opt/homebrew/bin/adb", "/usr/local/bin/adb"),
+               "tesseract_path": _first_path(shutil.which("tesseract") or "", "/opt/homebrew/bin/tesseract",
+                                             "/usr/local/bin/tesseract")}
+else:
+    # Shipped inside the bot folder so nothing needs installing (used when the configured path doesn't exist)
+    BUNDLED = {"adb_path": os.path.join(BASE_DIR, "platform-tools", "adb.exe"),
+               "tesseract_path": os.path.join(BASE_DIR, "Tesseract-OCR", "tesseract.exe")}
 os.makedirs(TEMPLATE_DIR, exist_ok=True)
-NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # no console flash per adb call
+NO_WINDOW = 0x08000000 if IS_WIN else 0  # no console flash per adb call
+DETACHED = {"creationflags": 0x00000008} if IS_WIN else {"start_new_session": True}  # outlive this process
+# cloudflared also gets its own process group on Windows (Ctrl+C in the parent's console must not reach it)
+DETACHED_TUNNEL = {"creationflags": 0x00000008 | 0x00000200} if IS_WIN else {"start_new_session": True}
+UI_FONT = "Segoe UI" if IS_WIN else "Helvetica Neue"  # macOS has no Segoe UI; Tk substitutes an ugly one
+MONO_FONT = "Consolas" if IS_WIN else "Menlo"
+
+
+def open_path(path):
+    """Open a file or folder in the desktop's default program."""
+    if IS_WIN:
+        os.startfile(path)  # Windows only
+    else:
+        subprocess.run(["open" if IS_MAC else "xdg-open", path], check=False)
+
+
+def emulator_path_ok(path):
+    """True when this path really is the emulator: BlueStacks 5 is an .exe file, BlueStacks Air is a .app bundle
+    (a directory, so isfile() would never match it on macOS)."""
+    return os.path.isfile(path) if IS_WIN else os.path.exists(path)
+
+
+def host_name():
+    """This machine's name (COMPUTERNAME exists only on Windows)."""
+    uname = getattr(os, "uname", None)
+    return os.environ.get("COMPUTERNAME") or (uname().nodename.split(".")[0] if uname else "") or "a PC"
+
+
+def python_gui_exe():
+    """sys.executable, but pythonw.exe on Windows so restarting the app doesn't flash a console window."""
+    exe = sys.executable
+    if IS_WIN and exe.lower().endswith("python.exe") and os.path.exists(exe[:-10] + "pythonw.exe"):
+        exe = exe[:-10] + "pythonw.exe"
+    return exe
 
 BUTTONS = [
     ("attack_button", "Attack! (home screen)"),
@@ -112,6 +182,7 @@ BUTTONS = [
     ("bb_return_home", "Builder Base Return Home  - builder base"),
     ("bb_elixir_bubble", "Builder Base elixir bubble  - builder base"),
     ("bb_gold_bubble", "Builder Base gold bubble  - builder base"),
+    ("bb_cart", "The Elixir Cart itself, by the dock  - builder base"),
     ("bb_cart_title", "Elixir Cart window title  - builder base"),
     ("bb_cart_collect", "Elixir Cart green Collect  - builder base"),
     ("bb_bonus_title", "'Star Bonus!' popup title  - builder base"),
@@ -314,7 +385,8 @@ SETTINGS = [
     ]),
 ]
 
-RUNTIME_KEYS = ("scans", "plans", "account_tags", "_last_account_idx", "loot_rate", "line_view")  # saved by the bot, not settings
+RUNTIME_KEYS = ("scans", "plans", "account_tags", "_last_account_idx", "loot_rate", "line_view", "ui_mode",
+                "sc_of_tag", "shortcuts_v")  # saved by the bot, not settings
 # Rarely-touched tuning: shown under 'Show advanced settings'
 ADVANCED = {"loot_settle_delay", "loot_recheck_delay", "loot_max_plausible", "hold_deploy", "damage_confirm_count",
             "timer_poll_interval", "hold_ms_per_troop",
@@ -351,8 +423,8 @@ def load_config():
             cfg[k] = path
     cfg["bb_bonus_days"] = dict(cfg.get("bb_bonus_days") or {})
     cfg["discord_webhook"] = cfg.get("discord_webhook") or DEFAULTS["discord_webhook"]  # blank saved = the built-in
-    player = r"C:\Program Files\BlueStacks_nxt\HD-Player.exe"
-    if not os.path.isfile(cfg.get("emulator_exe_path") or "") and os.path.isfile(player):
+    player = r"C:\Program Files\BlueStacks_nxt\HD-Player.exe" if IS_WIN else BS_APP_MAC
+    if not emulator_path_ok(cfg.get("emulator_exe_path") or "") and emulator_path_ok(player):
         cfg["emulator_exe_path"] = player  # so crash recovery can restart BlueStacks
     return cfg, err
 
@@ -851,7 +923,8 @@ def read_counter(frame, box):
 def troop_bar(frame):
     """Cards on the battle bar, left to right: [(x, y, kind, count)]. Each card is found by its dark
     outline (two tall vertical edges one card-width apart). kind: 'troop' (blue card with a count),
-    'spell' (purple card with a count), 'single' (hero / siege / pet: no count), 'used' (greyed x0),
+    'spell' (purple card with a count), 'hero' (purple card, no count), 'single' (Clan Castle / siege machine:
+    light blue, no count), 'used' (greyed x0),
     'empty' (dashed slot)."""
     glyphs = digit_glyphs()
     if glyphs is None:
@@ -921,10 +994,13 @@ def troop_bar(frame):
             cnt = number(top - int(H * 0.017), top + 35, a + (b - a) // 3, b - 4, 18)
         if grey.mean() > 0.4:
             kind = "used"
-        elif colored.mean() < 0.2 or not level_badge(a, b):
+        elif cnt is None and (colored.mean() < 0.2 or not level_badge(a, b)):  # a count = a real card (event
+            # troops have a grey card + an orange level badge)
             kind = "empty"
-        elif cnt is None:
-            kind = "single"
+        elif cnt is None:  # no count: a hero (purple card) or the Clan Castle / siege machine (light blue card)
+            edge = cv2.cvtColor(frame[int(H * 0.85):int(H * 0.95), a + 5:a + 14], cv2.COLOR_BGR2HSV)
+            e = edge[:, :, 0][(edge[:, :, 1] > 90) & (edge[:, :, 2] > 90)]
+            kind = "hero" if len(e) and 112 <= np.median(e) <= 160 else "single"  # CC ~94, heroes ~122-146
         else:
             hh = cv2.cvtColor(frame[top:top + 45, a + 6:a + (b - a) // 3], cv2.COLOR_BGR2HSV)
             hdr = hh[:, :, 0][(hh[:, :, 1] > 90) & (hh[:, :, 2] > 90)]
@@ -1154,6 +1230,24 @@ def settings_drag_start(f):
     return max(low) if low else None
 
 
+def settings_tag(frame):
+    """Player tag under the name in the Settings window ('#V9GJCRCL'), or None. Q and 0 look alike: compare tags
+    with same_tag()."""
+    if not HAVE_TESS:
+        return None
+    k = frame.shape[1] / 1920
+    g = cv2.cvtColor(frame[int(226 * k):int(262 * k), int(860 * k):int(1120 * k)], cv2.COLOR_BGR2GRAY)
+    try:
+        t = pytesseract.image_to_string(cv2.resize(g, None, fx=3, fy=3), timeout=5,
+                                        config="--psm 7 -c tessedit_char_whitelist=#0289PYLQGRJCUV").strip()
+    except Exception:
+        return None
+    return t if re.fullmatch(r"#[0289PYLQGRJCUV]{6,10}", t) else None
+
+
+same_tag = lambda a, b: bool(a and b) and a.replace("Q", "0") == b.replace("Q", "0")
+
+
 def settings_name(frame):
     """Player name beside the avatar in the Settings window (white on blue), or None."""
     if not HAVE_TESS:
@@ -1275,7 +1369,8 @@ class Abort(Exception):
 
 class Bot:
     def __init__(self, cfg, adb, emit, mode="farm"):
-        self.cfg, self.adb, self.emit, self.mode = cfg, adb, emit, mode  # "farm", "loot" (attack only), "walls"
+        # "farm", "loot" (attack only), "walls", "bb_loot" / "bb_farm" (Builder Base only, without / with upgrades)
+        self.cfg, self.adb, self.emit, self.mode = cfg, adb, emit, mode
         self.stop_evt = threading.Event()
         self.v = Vision()
         self.stats = dict(attacks=0, skipped=0, walls=0, upgrades=0, switches=0, recoveries=0, errors=0)
@@ -1290,6 +1385,7 @@ class Bot:
         self.loot = {}        # account -> [gold, elixir, dark, attacks] farmed this session
         self._names = list(dict.fromkeys((cfg.get("account_tags") or {}).values()))  # misreads snap to these
         self._saving_home = None  # account farming for its next home plan target: no Builder Base trips meanwhile
+        self._bb_saving = None  # resource the Builder Base plan is saving up (the Star Lab leaves it alone)
         self._view = None  # background zoom + pan for the base being scouted
         self._last_name = None
         self._cur = self._pre = None  # (account, (gold, elixir, dark)) now / just before the attack
@@ -1363,6 +1459,9 @@ class Bot:
         self.log("Farming started.", "ok")
         self.emit("stats", dict(self.stats))
         prev, unknown_since, backs, adb_fails, online = "START", None, 0, 0, None
+        awake = lambda on: os.name == "nt" and ctypes.windll.kernel32.SetThreadExecutionState(
+            0x80000000 | (0x1 if on else 0))  # ES_CONTINUOUS | ES_SYSTEM_REQUIRED: no sleeping while farming
+        awake(True)
         try:
             while True:
                 try:
@@ -1389,6 +1488,8 @@ class Bot:
                             unknown_since, backs = None, 0
                         elif self.reload_if_disconnected(frame):
                             unknown_since = None
+                        elif self.bb_bonus(self._last_name or "?"):  # the Star Bonus popup (home or Builder
+                            unknown_since = None                     # Base) - known, so no need to ask Groq
                         elif self.find(frame, "wall_okay_button"):
                             self.log("Closing an Okay/Cancel dialog with Back (never confirms).")
                             self.adb.back()
@@ -1429,6 +1530,8 @@ class Bot:
                     self.sleep(3)
         except Abort:
             pass
+        finally:
+            awake(False)
         self.log("Farming stopped.", "ok")
         self.emit("state", "Stopped")
 
@@ -1468,6 +1571,9 @@ class Bot:
         elif len(name) >= 3:
             self._names.append(name)
             self._last_name = name
+        key = getattr(self, "_sc_key", None)
+        if key and self._last_name and key.startswith(self._last_name + " ("):
+            self._last_name = key  # one of two accounts sharing an in-game name
         # unreadable (e.g. the XP bar animating over it just after a battle): the account hasn't changed
         return self._last_name or "?"
 
@@ -1495,12 +1601,28 @@ class Bot:
         self._pre = self._cur  # storage right before this attack
         self.tap(self.hits["attack_button"])
 
+    def ambiguous(self):
+        """True while the top-left name is one that two accounts share ('GeoCol2' and 'GeoCol2 (GeoCol2)') and
+        nothing yet says which of them this is - e.g. after switching accounts by hand."""
+        n = self._last_name
+        return bool(n) and " (" not in n and n != getattr(self, "_tag_ok", None) and any(k.startswith(n + " (") for k in self.cfg.get("scans") or {})
+
     def on_home(self, frame, prev):
         self.game_relaunches = 0
         self._view = None
+        self.account_name(frame)
+        if self.ambiguous() and self.mode != "loot" and time.time() >= getattr(self, "_amb_try", 0):
+            self._amb_try = time.time() + 600  # the export's player tag says which one (then account_name knows)
+            if self.scan_export():
+                return
         storage = self.track_loot(frame, self.read_storage(frame))
         if self.mode == "loot":  # Loot only: no upgrades, walls or account switching - just attack
             return self.attack_now()
+        if self.mode.startswith("bb_"):  # Builder Base only: never stays home
+            if not self.take_boat("builder"):
+                self.log("Builder Base only: couldn't find the boat - trying again in 2 min.", "warn")
+                self.sleep(120)
+            return
         if self.mode == "walls":  # Walls only: farm, and every time the next wall level is affordable, buy it
             if self.maybe_rescan("builder", hours=1):  # keeps the dashboard's wall count current
                 return
@@ -1537,9 +1659,13 @@ class Bot:
         self.attack_now()
 
     def on_menu(self, frame, prev):
+        if self.mode.startswith("bb_"):  # Builder Base only: never start a home-village attack - back out
+            return self.back_to_village()
         self.tap(self.hits["find_match_button"], self.cfg["matchmaking_settle_delay"])
 
     def on_army(self, frame, prev):
+        if self.mode.startswith("bb_"):
+            return self.back_to_village()
         self.tap(self.hits["confirm_attack_button"], self.cfg["matchmaking_settle_delay"])
 
     def on_bbend(self, frame, prev):
@@ -1547,6 +1673,8 @@ class Bot:
 
     def on_bbhome(self, frame, prev):
         """On the Builder Base outside a visit (a restart, a crash, a stray boat tap): collect and sail home."""
+        if self.mode.startswith("bb_"):
+            return self.bb_only()
         self.bb_bonus(self._last_name or "?")
         self.bb_collect()
         if not self.take_boat("home"):
@@ -1585,6 +1713,9 @@ class Bot:
 
     def on_scout(self, frame, prev):
         c = self.cfg
+        if self.mode.startswith("bb_"):  # Builder Base only: leave a home search (End Battle before deploying is free)
+            hit = self.find(frame, "surrender_button")
+            return self.tap(hit, 3.0) if hit else self.back_to_village()
         self.start_view()
         if c["loot_force_attack"]:
             return self.attack(None, None)
@@ -1708,14 +1839,14 @@ class Bot:
         return self.read_pair(frame, LOOT_PROMPT, "use_groq_for_loot",
                               ("loot_gold_region", "loot_elixir_region"), True)
 
-    def read_storage(self, frame):
+    def read_storage(self, frame, village="home"):
         g, e = self.read_pair(frame, STORAGE_PROMPT, "use_groq_for_bank",
                               ("bank_gold_region", "bank_elixir_region"), False,
                               cap=99_999_999)  # storages hold far more than any base's loot
         s = {"gold": g, "elixir": e}
         if g is not None or e is not None:
-            self.emit("storage", s)
-        self.log(f"Storage: gold {g if g is None else f'{g:,}'} / elixir {e if e is None else f'{e:,}'}")
+            self.emit("storage", dict(s, village=village))
+        self.log(("Builder Base storage" if village == "builder" else "Storage") + f": gold {g if g is None else f'{g:,}'} / elixir {e if e is None else f'{e:,}'}")
         return s
 
     # --- attacking ---
@@ -1723,8 +1854,8 @@ class Bot:
         loot = f" - gold {gold:,} / elixir {elixir:,}" if gold is not None and elixir is not None else ""
         self.log(f"Attacking{loot}", "ok")
         self.bump("attacks")
-        self.deploy()
-        self.finish_battle()
+        if self.deploy():
+            self.finish_battle()
 
     def deploy(self):
         c = self.cfg
@@ -1761,35 +1892,58 @@ class Bot:
             self.log(f"Deployment preview: {troop_n} troops, {single_n} heroes/siege; spells {spell_note}.")
         except Exception as e:
             log_file.info(f"debug_deploy.png: {e}")
-        if not self.auto_deploy(a, b, bar):
-            self.log("No deployable troop, hero, siege, or enabled spell cards were detected (see debug_deploy.png).", "err")
-            return
-        after = self.shot()
-        after_bar = troop_bar(after)
-        to_check = [cd for cd in (bar or []) if cd[2] != "spell" or c.get("deploy_spells")]
-        confirmed, checked = self.deployment_check(to_check, after_bar)
-        after_dbg = after.copy()
-        cv2.line(after_dbg, tuple(a), tuple(b), (0, 210, 255), 6)
-        fp = c["fixed_points"]
-        if fp.get("spell_point"):
-            cv2.line(after_dbg, tuple(fp["spell_point"]), tuple(fp.get("spell_line_end") or fp["spell_point"]),
-                     (255, 80, 220), 6)
-        cv2.putText(after_dbg, f"POST-CHECK: {confirmed}/{checked} selected cards changed", (30, 55),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-        for x, y, kind, n in after_bar:
-            cv2.putText(after_dbg, f"{kind} {n or ''}", (x - 60, y - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                        (255, 255, 255), 2)
-        cv2.imwrite(os.path.join(BASE_DIR, "debug_deploy_after.png"), after_dbg)
-        self.emit("frame", cv2.resize(after_dbg, (960, int(960 * after_dbg.shape[0] / after_dbg.shape[1])),
-                                       interpolation=cv2.INTER_AREA))
-        if checked:
-            self.log(f"Deployment check: {confirmed}/{checked} cards visibly changed; see debug_deploy_after.png."
-                     if confirmed == checked else
-                     f"Deployment check: {confirmed}/{checked} cards visibly changed; the rest are unconfirmed "
-                     "(see debug_deploy_after.png).", "ok" if confirmed == checked else "warn")
-        else:
-            self.log("Deployment check couldn't match the troop bar after placement (see debug_deploy_after.png).",
-                     "warn")
+        if self.auto_deploy(a, b, bar):
+            self.deployment_check_log(a, b, bar)  # ours: verify + write debug_deploy_after.png (logging only)
+            return True
+        # no troop bar: often the game was still / again searching (white clouds) - wait for the screen to settle
+        for _ in range(8):
+            self.sleep(1.0)
+            f = self.shot()
+            if self.find(f, "next_button"):  # a base to scout (again): the main loop checks its loot first
+                self.log("The game was still searching when the army was due - checking this base's loot again.",
+                         "warn")
+                self._view = None
+                return False
+            if troop_bar(f):
+                if self.auto_deploy(a, b):
+                    return True
+                break
+        self.log("Couldn't read the troop bar - no troops deployed (see debug_deploy.png).", "err")
+        return True  # in a battle we can't use: finish_battle surrenders it
+
+    def deployment_check_log(self, a, b, bar):
+        """Ours: read the troop bar after placement, say how many cards visibly changed and write
+        debug_deploy_after.png. Logging only - it never changes what the bot does."""
+        c = self.cfg
+        try:
+            after = self.shot()
+            after_bar = troop_bar(after)
+            to_check = [cd for cd in (bar or []) if cd[2] != "spell" or c.get("deploy_spells")]
+            confirmed, checked = self.deployment_check(to_check, after_bar)
+            after_dbg = after.copy()
+            cv2.line(after_dbg, tuple(a), tuple(b), (0, 210, 255), 6)
+            fp = c["fixed_points"]
+            if fp.get("spell_point"):
+                cv2.line(after_dbg, tuple(fp["spell_point"]), tuple(fp.get("spell_line_end") or fp["spell_point"]),
+                         (255, 80, 220), 6)
+            cv2.putText(after_dbg, f"POST-CHECK: {confirmed}/{checked} selected cards changed", (30, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            for x, y, kind, n in after_bar:
+                cv2.putText(after_dbg, f"{kind} {n or ''}", (x - 60, y - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                            (255, 255, 255), 2)
+            cv2.imwrite(os.path.join(BASE_DIR, "debug_deploy_after.png"), after_dbg)
+            self.emit("frame", cv2.resize(after_dbg, (960, int(960 * after_dbg.shape[0] / after_dbg.shape[1])),
+                                           interpolation=cv2.INTER_AREA))
+            if checked:
+                self.log(f"Deployment check: {confirmed}/{checked} cards visibly changed; see debug_deploy_after.png."
+                         if confirmed == checked else
+                         f"Deployment check: {confirmed}/{checked} cards visibly changed; the rest are unconfirmed "
+                         "(see debug_deploy_after.png).", "ok" if confirmed == checked else "warn")
+            else:
+                self.log("Deployment check couldn't match the troop bar after placement (see debug_deploy_after.png).",
+                         "warn")
+        except Exception as e:
+            log_file.info(f"debug_deploy_after.png: {e}")
 
     @staticmethod
     def deployment_check(before, after):
@@ -1903,6 +2057,8 @@ class Bot:
     def wall_price(self):
         """Cost of the next wall upgrade (the lowest wall that isn't max), 0 if every wall is max, None if this
         account's walls haven't been scanned."""
+        if self.ambiguous():
+            return None  # not sure whose walls these are
         sd = ((self.cfg.get("scans") or {}).get(self._last_name) or {}).get("home") or {}
         counts, mx, todo, _ = walls_left(sd)
         if not counts or not mx:
@@ -1930,7 +2086,11 @@ class Bot:
             if time.time() < self._bank_backoff.get(cur, 0):
                 continue
             self.sleep(0.5)
-            again = white_number(self.shot(), self.cfg["ocr_regions"].get(f"bank_{cur}_region") or (0, 0, 1, 1))
+            region = self.cfg["ocr_regions"].get(f"bank_{cur}_region") or (0, 0, 1, 1)
+            again = white_number(self.shot(), region)
+            if again is None:  # the counter mid-animation (just after a battle): one more look
+                self.sleep(1.0)
+                again = white_number(self.shot(), region)
             if again != val:  # a one-off misread (e.g. 1.7M read as 17M) must never trigger a purchase
                 self.log(f"{cur.title()} read {val:,} then {again} - not sure, skipping this time.", "warn")
                 continue
@@ -2028,6 +2188,19 @@ class Bot:
                 rows = again
                 break
             rows = again or rows
+        # one 'Wall xN' row per level, not in price order ('Wall x112 1,500,000' above 'Wall x184 1,000,000'):
+        # take the cheapest affordable one. A row at the bottom edge may have another just under it - nudge up.
+        box = panel_box(self.shot())
+        if box and max(y for _, y in rows) > box[3] - 90:
+            cx = (box[0] + box[1]) // 2
+            self.adb.swipe(cx, box[3] - 60, cx, box[3] - 260, 700)
+            self.sleep(1.2)
+            rows = self.find_wall_rows(self.shot()) or rows
+        f = self.shot()
+        box = panel_box(f)
+        if box and len(rows) > 1:  # unaffordable prices are red, read as None: those go last
+            rows = sorted(rows, key=lambda r: white_number(f, (box[1] - 200, r[1] - 20, box[1] - 10, r[1] + 20))
+                          or 10 ** 12)
         self.tap(rows[0], 1.2)
         f = self.shot()
         if panel_box(f):  # the list sometimes stays open over the buttons: its icon closes it
@@ -2097,8 +2270,8 @@ class Bot:
                 k = f.shape[1] / 1920  # bar layout is fixed: Remove Wall, Add +10, Add +1, gold Upgrade, elixir Upgrade
                 self.tap((pair[0][0] - int(612 * k), pair[0][1] + int(12 * k)), 0.7)
             self.tap(btn, 1.2)
+        ok = self.wait_for("wall_okay_button", 3 if want is None else 1)  # it animates in (slower at 30 FPS)
         frame = self.shot()
-        ok = self.find(frame, "wall_okay_button")
         if ok:  # 'Upgrade Walls' dialog: check it says Walls + this currency + a price, never gems
             h, w = frame.shape[:2]
             try:
@@ -2195,6 +2368,11 @@ class Bot:
                 if to == "home":
                     self.bb_collect()
                     boat = self.find_any_zoom(self.shot(), "bb_boat") or boat
+                if boat[1] < 200 or boat[0] > 1500:  # under the resource bars: a tap there opens the bar's
+                    # tooltip (which then hides the boat) - drag the map to bring the boat toward the middle
+                    self.adb.swipe(960, 540, 960 + (960 - boat[0]) // 2, 540 + (540 - boat[1]) // 2, 600)
+                    self.sleep(1.0)
+                    boat = self.find_any_zoom(self.shot(), "bb_boat") or boat
                 self.tap(boat, 2.0)
                 if self.wait_for(want, 25, poll=1.0):
                     self.sleep(1.0)
@@ -2210,8 +2388,11 @@ class Bot:
         # only bubbles in the open middle: one sitting over the edge buttons (Season Pass, Attack, Shop, the
         # resource bars...) would tap that button instead. It gets collected another time.
         safe = lambda p: 0.13 * W < p[0] < 0.87 * W and 0.11 * H < p[1] < 0.76 * H
-        for xy in filter(safe, self.matches(f, "bb_elixir_bubble", 0.7) + self.matches(f, "bb_gold_bubble", 0.7)
-                         + self.matches(f, "bb_gem_bubble", 0.7)):
+        # the Elixir Cart sits up by the dock: its bubble is often off the top edge, so tap the cart itself
+        cart = self.find_any_zoom(f, "bb_cart", 0.75)
+        cart = [cart] if cart and 0.13 * W < cart[0] < 0.76 * W and cart[1] < 0.76 * H else []
+        for xy in cart + list(filter(safe, self.matches(f, "bb_elixir_bubble", 0.7)
+                                     + self.matches(f, "bb_gold_bubble", 0.7) + self.matches(f, "bb_gem_bubble", 0.7))):
             self.tap(xy, 1.0)
             f = self.shot()
             if self.find(f, "bb_cart_title"):
@@ -2233,7 +2414,7 @@ class Bot:
         else:  # never a blind tap: Back closes the popup (the bonus is already credited)
             self.adb.back()
             self.sleep(1.5)
-        self.log(f"Builder Base: Star Bonus collected ({name}).", "ok")
+        self.log(f"Star Bonus collected ({name}).", "ok")
         return True
 
     def bb_clock_boost(self):
@@ -2271,7 +2452,7 @@ class Bot:
         cards, end = [], time.time() + 40
         while not cards and time.time() < end:  # matchmaking, then the battle screen with the troop bar
             self.sleep(1.5)
-            cards = [c for c in troop_bar(self.shot()) if c[2] in ("single", "troop")]
+            cards = [c for c in troop_bar(self.shot()) if c[2] in ("hero", "single", "troop")]
         if not cards:
             return self.log("Builder Base: no battle screen after Find Now.", "warn")
         self.bump("attacks")
@@ -2284,10 +2465,16 @@ class Bot:
             done = self.find(f, "bb_return_home")
             if done:
                 self.tap(done, 3.0)
-                return self.wait_for("bb_attack_button", 15)
+                if not self.wait_for("bb_attack_button", 15):
+                    return None
+                if self.mode.startswith("bb_"):  # the session's Builder Base loot / hour: storage after every battle
+                    self.sleep(1.5)
+                    f = self.shot()
+                    self.track_bb(self.account_name(f), self.read_storage(f, village="builder"))
+                return True
             # 100% on stage 1 starts stage 2 with extra cards (+ the survivors): drop everything not used up.
             # Tapping an already-deployed card is harmless (the Battle Machine's = its ability).
-            self.bb_deploy([c for c in troop_bar(f) if c[2] in ("single", "troop")])
+            self.bb_deploy([c for c in troop_bar(f) if c[2] in ("hero", "single", "troop")])
         self.log("Builder Base: battle didn't finish in time.", "warn")
 
     def bb_deploy(self, cards):
@@ -2319,58 +2506,152 @@ class Bot:
         self.emit("state", f"Builder Base ({name})")
         self.bb_collect()
         self.bb_clock_boost()  # first, while the arrival view shows the whole base (its bubble is on the tower)
-        c = self.cfg
-        for rnd in range(2):  # upgrades before AND after the attacks (the loot may pay for more)
-            for kind in ("bb_builder", "bb_lab"):
-                if c["bb_builder_upgrades" if kind == "bb_builder" else "bb_lab_upgrades"]:
-                    for _ in range(3):
-                        if not self.free_slots(self.shot(), kind):
-                            self.maybe_rescan(kind)
-                            break
-                        n = self.stats["upgrades"]
-                        self.upgrade_from_list(kind)
-                        if self.stats["upgrades"] == n:
-                            break
-            if rnd or not c["bb_attacks_enabled"]:
-                break
-            last = None
-            # Star Bonus: a popup each time the counter fills, several times a day. Once they're used up the counter
-            # just rolls over with no popup - then this account is done until tomorrow.
-            for _ in range(12):
-                if self.cfg["bb_bonus_days"].get(name) == time.strftime("%Y-%m-%d"):
-                    self.log("Builder Base: no Star Bonus left today - no attacks.")
-                    break
-                if self.bb_bonus(name):
-                    last = None  # the counter restarts after a bonus: that's not a 'rolled over without one'
-                f = self.shot()
-                if not self.find(f, "bb_attack_button"):  # still in a battle / its end screen: never press Back here
-                    done = self.wait_for("bb_return_home", 240, poll=3)
-                    if done:
-                        self.tap(done, 3.0)
-                    if not self.wait_for("bb_attack_button", 15):
-                        self.log("Builder Base: not back on the village - stopping the attacks.", "warn")
-                        break
-                    f = self.shot()
-                st = self.bb_stars(f)
-                if not st:  # the counter disappears from the Attack button once today's bonuses are all used
-                    if name != "?":
-                        self.cfg["bb_bonus_days"][name] = time.strftime("%Y-%m-%d")
-                        save_config(self.cfg)
-                    self.log("Builder Base: all of today's Star Bonuses collected - done until tomorrow.", "ok")
-                    break
-                if last and st[0] < last[0]:  # rolled over with no popup: today's bonus was already taken
-                    if name != "?":
-                        self.cfg["bb_bonus_days"][name] = time.strftime("%Y-%m-%d")
-                        save_config(self.cfg)
-                    self.log("Builder Base: star counter rolled over without a bonus - done for today.", "ok")
-                    break
-                last = st
-                self.log(f"Builder Base: stars {st[0]}/{st[1]} - attacking.")
-                self.bb_attack()
-            self._upgrade_backoff.pop("bb_builder", None)
-            self._upgrade_backoff.pop("bb_lab", None)
+        self.bb_session(name, upgrades=True)
         self.take_boat("home")  # the boat view also shows the Elixir Cart: collect it (new defense rewards) first
         return True
+
+    def bb_session(self, name, upgrades=True):
+        """On the Builder Base: upgrades, attacks until today's Star Bonuses are collected, upgrades again (the loot
+        may pay for more). Builder Base attacks only pay out through the Star Bonus - after that, nothing."""
+        c = self.cfg
+        for rnd in range(2):
+            if upgrades:
+                self.bb_upgrades()
+            if rnd or not (c["bb_attacks_enabled"] or self.mode.startswith("bb_")):
+                break
+            self.bb_attacks(name)
+            self._upgrade_backoff.pop("bb_builder", None)
+            self._upgrade_backoff.pop("bb_lab", None)
+
+    def bb_upgrades(self):
+        """Keep the Builder Base builders + Star Lab busy: the next target in this account's plan (or wait for it),
+        else the most expensive thing affordable. True if any builder / the Star Lab is still free afterwards."""
+        free, self._bb_saving = False, None
+        for kind in ("bb_builder", "bb_lab"):
+            if not self.cfg["bb_builder_upgrades" if kind == "bb_builder" else "bb_lab_upgrades"]:
+                continue
+            if kind == "bb_lab" and self._bb_saving == "elixir":
+                self.log("Star Lab: waiting - the Builder Base plan is saving Builder Elixir for its next upgrade.")
+                continue
+            for _ in range(3):
+                if not self.free_slots(self.shot(), kind):
+                    self.maybe_rescan(kind)
+                    break
+                n = self.stats["upgrades"]
+                self.upgrade_from_list(kind)
+                if self.stats["upgrades"] == n:
+                    free = True  # a slot is free but nothing was bought: saving up for it
+                    break
+        return free
+
+    def bb_done_today(self, name):
+        return self.cfg["bb_bonus_days"].get(name) == time.strftime("%Y-%m-%d")
+
+    def bb_attacks(self, name):
+        """Attack until today's Star Bonuses are all collected."""
+        last = None
+        # Star Bonus: a popup each time the counter fills, several times a day. Once they're used up the counter
+        # just rolls over with no popup - then this account is done until tomorrow.
+        for _ in range(12):
+            if self.bb_done_today(name):
+                if not self.mode.startswith("bb_"):
+                    self.log("Builder Base: no Star Bonus left today - no attacks.")
+                break
+            if self.bb_bonus(name):
+                last = None  # the counter restarts after a bonus: that's not a 'rolled over without one'
+            f = self.shot()
+            if not self.find(f, "bb_attack_button"):  # still in a battle / its end screen: never press Back here
+                done = self.wait_for("bb_return_home", 240, poll=3)
+                if done:
+                    self.tap(done, 3.0)
+                if not self.wait_for("bb_attack_button", 15):
+                    self.log("Builder Base: not back on the village - stopping the attacks.", "warn")
+                    break
+                f = self.shot()
+            st = self.bb_stars(f)
+            if not st:  # the counter disappears from the Attack button once today's bonuses are all used
+                if name != "?":
+                    self.cfg["bb_bonus_days"][name] = time.strftime("%Y-%m-%d")
+                    save_config(self.cfg)
+                self.log("Builder Base: all of today's Star Bonuses collected - done until tomorrow.", "ok")
+                break
+            if last and st[0] < last[0]:  # rolled over with no popup: today's bonus was already taken
+                if name != "?":
+                    self.cfg["bb_bonus_days"][name] = time.strftime("%Y-%m-%d")
+                    save_config(self.cfg)
+                self.log("Builder Base: star counter rolled over without a bonus - done for today.", "ok")
+                break
+            last = st
+            self.log(f"Builder Base: stars {st[0]}/{st[1]} - attacking.")
+            self.bb_attack()
+
+    def track_bb(self, name, s):
+        """Builder Base loot this session: what the storages gained since the last read on this account (battles,
+        Star Bonuses, the Elixir Cart, collectors) - read after every battle. ponytail: an upgrade bought in
+        between hides that stretch's gain."""
+        now, n, ups = (s.get("gold"), s.get("elixir")), self.stats["attacks"], self.stats["upgrades"]
+        pre = getattr(self, "_bb_pre", None)
+        if None in now or "?" in name:
+            return  # unreadable: keep the last good read as the baseline
+        if not pre or pre[0] != name:
+            self._bb_pre = (name, now, n, ups)
+            return
+        # a drop with nothing bought = a misread (e.g. a lost digit): keep the old baseline, or the read after it
+        # would count the 'recovery' as loot
+        drop = ups == pre[3] and any(a < b * 0.9 for a, b in zip(now, pre[1]))
+        self._bb_drops = getattr(self, "_bb_drops", 0) + 1 if drop else 0
+        if drop and self._bb_drops < 2:  # twice in a row: it's real (spent by hand) - take it as the new baseline
+            return
+        self._bb_pre = (name, now, n, ups)
+        gain = [max(0, a - b) for a, b in zip(now, pre[1])]
+        if max(gain) > 5_000_000 or not (any(gain) or n > pre[2]):  # more in one go = a misread
+            return
+        row = self.loot.setdefault(name, [0, 0, 0, 0])
+        row[0], row[1], row[3] = row[0] + gain[0], row[1] + gain[1], row[3] + n - pre[2]
+        self.emit("loot", {a: list(r) for a, r in self.loot.items()})
+        if any(gain):
+            self.log(f"{name}: +{gain[0]:,} Builder Gold, +{gain[1]:,} Builder Elixir")
+
+    def bb_only(self):
+        """'Builder Base only' modes: stay on the Builder Base.
+        bb_loot: attack non-stop on this account, claiming the Elixir Cart every 10 attacks.
+        bb_farm: builders + Star Lab follow the planner (or upgrade anything, with no plan); attacks for today's
+        Star Bonuses, then rounds of 5 attacks + the Elixir Cart, checking the upgrades after each round - it stays
+        on the account until its next upgrade is bought, and only moves on (when rotating) once all are busy."""
+        f = self.shot()
+        name = self.account_name(f)
+        self.emit("state", f"Builder Base only ({name})")
+        self.track_bb(name, self.read_storage(f, village="builder"))
+        self.bb_bonus(name)
+        self.bb_collect()
+        self.bb_clock_boost()
+        if self.mode == "bb_loot":  # loot only: a plain loop on this account - attack, attack, attack; claim the
+            for _ in range(10):     # Elixir Cart every 10 attacks. No Star Bonus counting, upgrades or switching.
+                self.bb_bonus(name)  # a Star Bonus popup can still show up: collect it and carry on
+                if not self.find(self.shot(), "bb_attack_button") and not self.wait_for("bb_attack_button", 20):
+                    return  # not back on the village: the main loop sorts the screen out
+                self.bb_attack()
+            return  # next round: collect (the cart) + boost, then 10 more
+        self.bb_session(name, upgrades=True)
+        if not self.bb_done_today(name):
+            return  # attacks stopped for another reason (screen, battle): look again
+        if getattr(self, "_bb_on_logged", None) != name:
+            self._bb_on_logged = name
+            self.log(f"Builder Base farm: Star Bonuses done ({name}) - farming on for the next upgrade.")
+        # farm in short rounds, checking the upgrades after each: buys the plan's next target the moment it's
+        # affordable (or anything, with no plan)
+        for _ in range(5):
+            if not self.find(self.shot(), "bb_attack_button") and not self.wait_for("bb_attack_button", 20):
+                return  # not back on the village: the main loop sorts the screen out
+            self.bb_attack()
+        self.bb_collect()  # the Elixir Cart (and collectors)
+        self._upgrade_backoff.pop("bb_builder", None)
+        self._upgrade_backoff.pop("bb_lab", None)
+        saving = self.bb_upgrades()
+        # next account only once every builder + the Star Lab here is busy - never while saving up for an upgrade
+        if not saving and self.cfg["rotate_accounts"] and time.time() >= self._rotate_pause_until:
+            self._switch_streak = 0  # there's always more to farm on the Builder Base: never 'all done'
+            self.switch_account()
 
     def reload_if_disconnected(self, frame):
         """'Anyone there? You have been disconnected due to inactivity' -> RELOAD GAME, then wait for it to load."""
@@ -2439,12 +2720,19 @@ class Bot:
             self._saving_home = None
         seen = self.read_list()  # the whole list first: the discount and levels are worked out from all of it
         plan, levels = self.plan_positions(kind, seen)
+        other = None  # saving up for the plan's next target: the resource it does NOT need (spare builders use it)
         if plan:  # this account has a plan: stick to it - the next target in order, or wait (keep farming) for it
             i = min(plan.values())
             rows = [(nm, p, ok) for nm, p, ok in seen if plan.get((nm, p)) == i]
             buy = [r for r in rows if r[2]]
-            if not buy:
-                it = self.plan_items(kind)[i]
+            it = self.plan_items(kind)[i]
+            res = wiki_data()[it["key"]]["levels"][0]["res"]
+            other = None
+            if not buy and kind == "bb_builder":
+                self._bb_saving = res  # the Star Lab won't spend it meanwhile
+                if (free_before or 0) >= 2:  # a builder to spare (one stays free for the target): spend the
+                    other = res              # other resource instead of letting it sit at max
+            if not buy and other is None:
                 self._upgrade_backoff[kind] = time.time() + 900
                 if kind == "builder":  # farm home until it's bought - the Builder Base waits, the list stays shut
                     self._saving_home = (self._last_name, min(p for _, p, _ in rows),
@@ -2457,11 +2745,20 @@ class Bot:
         for nm, price, ok in seen:
             skip = is_wall(nm) or (  # walls: the wall routine; TH: optional no-rush
                 self.cfg.get("skip_town_hall", True) and re.search(r"t[o0]wn\s*ha", nm.lower()))
-            if skip or not ok or (plan and plan.get((nm, price)) != min(plan.values())):
+            if skip or not ok or levels.get((nm, price)) == 0 or nm.lower().startswith("new "):
+                continue  # 'New ...' rows build a new one: that's placing it from the shop, not an upgrade
+            if kind.endswith("builder") and wiki_key(nm, "builder" if kind.startswith("bb_") else "home") is None \
+                    and norm_name(nm) not in NO_WIKI:
+                continue  # event Crafting Station defenses (Hot Candle, Cake-A-Pult...): a 3-way stat window
+            if plan and other is not None:  # saving up: only things paid in the other resource
+                k = wiki_key(nm, "builder")
+                if not k or wiki_data()[k]["levels"][0]["res"] == other:
+                    continue
+            elif plan and plan.get((nm, price)) != min(plan.values()):
                 continue
             bb = next((i for i, r in enumerate(BB_DEFAULT_ROWS) if name_match(nm, r["name"])), 99) \
                 if kind == "bb_builder" else 99
-            rank = (plan.get((nm, price), 10 ** 6), bb, -price)  # 1) your plan 2) 6th builder first 3) priciest
+            rank = (plan.get((nm, price), 10 ** 6), bb, -price)  # 1) your plan 2) key BB buildings 3) priciest
             if not best or rank < best[3]:
                 best = (nm, price, 0, rank)
         if not best:
@@ -2474,7 +2771,7 @@ class Bot:
         self.log(f"{KIND_NAMES[kind]}: choosing '{nm}'" + (f" (level {lv} -> {lv + 1})" if lv is not None else "")
                  + f" for {price:,} - "
                  + (f"#{best[3][0] + 1} in your upgrade plan." if best[3][0] < 10 ** 6
-                    else "Builder Base: Builder Hall / 6th builder (O.T.T.O's Outpost) first." if r[0] < 99
+                    else "a key Builder Base building first (hall, heroes, barracks, labs, clock)." if r[0] < 99
                     else "the most expensive one you can afford."))
         self._started = (kind, nm, price, lv)
         self.tap(icon, 1.0)  # close + reopen = back at the top, then page down until it's on screen
@@ -2494,6 +2791,13 @@ class Bot:
             self._upgrade_backoff[kind] = time.time() + 600
             self.back_to_village(icon)
             return self.log(f"{KIND_NAMES[kind]}: lost '{nm}' after re-opening the list - will retry.", "warn")
+        for _ in range(6):  # the list glides on after a swipe: tap only once two reads agree where the row is
+            self.sleep(0.4)
+            again = [r for r in list_rows(self.shot()) if r[1] == price and r[2] and name_match(r[0], nm)]
+            if again and abs(again[0][3][1] - match[0][3][1]) <= 4:
+                match = again
+                break
+            match = again or match
         self.tap(match[0][3], 1.6)
         if self.find(self.shot(), "guardians_title"):
             f, k = self.shot(), self.shot().shape[1] / 1920
@@ -2511,7 +2815,9 @@ class Bot:
                 self.tap(icon, 1.2)
             got, glv = self.selected_label(self.shot())  # is the selected building really the one chosen?
             want = re.sub(r"(?i)\s*x\s*\d+\s*$", "", nm)
-            if got and not name_match(got, want):
+            base = "builder" if kind.startswith("bb_") else "home"
+            gk, wk = wiki_key(got, base) if got else None, wiki_key(want, base)
+            if gk and wk and gk != wk:  # clearly another building; OCR noise in the label doesn't count
                 self._upgrade_backoff[kind] = time.time() + 600
                 self.back_to_village(icon)
                 return self.log(f"{KIND_NAMES[kind]}: the list selected '{got}' (level {glv}), not '{want}' - "
@@ -2524,8 +2830,10 @@ class Bot:
                 hit, shown = self.resource_confirm(kind)  # the GREEN resource Confirm only
         if not hit:
             self._upgrade_backoff[kind] = time.time() + 600
+            cv2.imwrite(os.path.join(BASE_DIR, "debug_upgrade.png"), self.shot())
             self.back_to_village(icon)
-            return self.log(f"{KIND_NAMES[kind]}: no green Confirm for '{nm}' - backed out.", "warn")
+            return self.log(f"{KIND_NAMES[kind]}: no green Confirm for '{nm}' - backed out "
+                            "(screen: debug_upgrade.png).", "warn")
         if shown != price:
             self._upgrade_backoff[kind] = time.time() + 600
             self.back_to_village(icon)
@@ -2627,8 +2935,8 @@ class Bot:
             hall = max(reqs) if reqs else None
         hero = next((r["level"] for r in items if r["key"] == "home:hero hall" and r["level"] is not None), None)
         acc = self._last_name
-        if not acc or acc == "?":  # never file a scan under an unknown account - it'd mix accounts up
-            self.log("Upgrade planner: couldn't read the account name - scan not saved.", "warn")
+        if not acc or acc == "?" or self.ambiguous():  # never file a scan under an unknown account - it'd mix
+            self.log("Upgrade planner: not sure which account this is - scan not saved.", "warn")  # them up
             return {"items": items, "discount": f, "hall": hall}
         scans = self.cfg.setdefault("scans", {}).setdefault(acc, {})
         old = scans.get(base) or {}
@@ -2755,7 +3063,7 @@ class Bot:
         self.back_to_village()
         f = self.shot()
         k = f.shape[1] / 1920
-        self.tap(self.find(f, "settings_cog_button") or (int(1842 * k), int(765 * k)), 1.5)
+        self.tap(self.find(f, "settings_cog_button") or (int(1842 * k), int(765 * k)), 0.6)
         # strict matches only: a looser one takes look-alike green buttons (Credits, Change Name...)
         more = None
         for _ in range(6):
@@ -2766,21 +3074,26 @@ class Bot:
                 near = n and difflib.get_close_matches(n.lower(), [x.lower() for x in self._names], 1, 0.75)
                 self._settings_name = next((x for x in self._names if near and x.lower() == near[0]), n)
                 break
-            self.sleep(0.8)
-        data = None
+            self.sleep(0.5)
+        data, hit = None, None
         if more:
-            self.tap(more, 2.0)  # let the window finish opening before anything touches it
+            self.tap(more, 0.8)
+            for _ in range(8):  # touch nothing until the More Settings window has finished opening
+                if self.v.find(self.shot(), "more_settings_button", 0.9) is None:
+                    break
+                self.sleep(0.3)
+            self.sleep(0.5)
             hit = None
             for _ in range(10):  # the page opens wherever it was last scrolled to (the top after a game start)
                 f = self.shot()
                 hit = self.v.find(f, "export_copy_row", 0.9)  # the Change Name row scores ~0.75
-                y = None if hit else settings_drag_start(f)
-                if y is None:
+                if hit:
                     break
-                # SLOW drag from a grey section header, never from a row: a touch on a row that doesn't turn
-                # into a scroll presses it (flips a setting, opens Change Name...)
-                self.adb.swipe(int(500 * k), y, int(500 * k), max(int(20 * k), y - int(400 * k)), 1200)
-                self.sleep(1.2)
+                # SLOW drag from a grey section header if one is low on the page, else from the setting NAMES at
+                # the rows' left (plain text) - never the buttons on the right, which a touch would press
+                y = settings_drag_start(f) or int(880 * k)
+                self.adb.swipe(int(500 * k), y, int(500 * k), max(int(160 * k), y - int(650 * k)), 700)
+                self.sleep(0.8)
             if hit:
                 self.tap((hit[0] + int(398 * k), hit[1]), 1.0)  # the green Copy button at the row's right
                 for _ in range(10):  # BlueStacks Air may take longer to sync Android's clipboard to macOS
@@ -2793,9 +3106,10 @@ class Bot:
                     except (ValueError, AttributeError, TypeError):
                         pass
                     self.sleep(1.0)
-                if data is None:
-                    self.log("Data Export Copy was tapped, but fresh export JSON wasn't available on the Mac clipboard; "
-                             "using the builder-list fallback.", "warn")
+        if not data:  # which step: for the debug report
+            cv2.imwrite(os.path.join(BASE_DIR, "debug_export.png"), self.shot())
+            log_file.info("export failed: " + ("no More Settings button" if not more else "no Copy row found"
+                                               if not hit else "clipboard had no fresh export"))
         self.back_to_village()
         return data
 
@@ -2812,9 +3126,20 @@ class Bot:
         # never fails just because a name couldn't be read (a fancy name / font / layout on another PC)
         acc = (tags.get(data["tag"]) or (self._last_name if self._last_name not in (None, "?") else None)
                or getattr(self, "_settings_name", None) or data["tag"])
+        bases = export_items(data)
+        if data["tag"] not in tags and acc in tags.values():
+            # a new tag under a name another account already has (two accounts called 'GeoCol2'): never file it
+            # over that one - its own 'name (...)' entry with this Town Hall, else a new one keyed by the tag
+            hall = next((r["level"] - r["upgrading"] for r in bases.get("home") or [] if r["key"] == "home:town hall"),
+                        None)
+            acc = next((k for k, s in (self.cfg.get("scans") or {}).items() if k.startswith(acc + " (")
+                        and k not in tags.values() and ((s or {}).get("home") or {}).get("hall") == hall),
+                       f"{acc} ({data['tag']})")
+        self._sc_key = acc if " (" in acc else None  # what account_name() reports for a shared in-game name
+        self._tag_ok = acc  # the export's tag settled which account this is
         tags[data["tag"]] = self._last_name = acc
         scans = self.cfg.setdefault("scans", {}).setdefault(acc, {})
-        for base, items in export_items(data).items():
+        for base, items in bases.items():
             if not items:
                 continue
             hall = next((r["level"] - r["upgrading"] for r in items
@@ -2935,7 +3260,8 @@ class Bot:
         return True
 
     def list_accounts(self, frame):
-        """Account names on the Supercell ID panel: the bold name that has a 'Town Hall' line under it."""
+        """Rows of the Supercell ID panel on screen: [{'sc': Supercell ID name, 'game': in-game name (rough OCR),
+        'th': Town Hall, 'xy': where to tap}] - a row is the bold name with a 'Town Hall: N' line under it."""
         x0 = frame.shape[1] * 2 // 3
         try:
             d = pytesseract.image_to_data(cv2.cvtColor(frame[:, x0:], cv2.COLOR_BGR2GRAY), config="--psm 11",
@@ -2944,9 +3270,76 @@ class Bot:
             return []
         words = [(t.strip(), x0 + d["left"][i] + d["width"][i] // 2, d["top"][i] + d["height"][i] // 2)
                  for i, t in enumerate(d["text"]) if t.strip()]
-        towns = [(x, y) for t, x, y in words if t.lower() == "town"]
-        return [(t, (x, y)) for t, x, y in words
-                if any(abs(tx - x) < 90 and 40 < ty - y < 75 for tx, ty in towns)]
+        self._list_end = any(t.upper() == "OTHER" for t, _, _ in words)  # 'OTHER IDS': the list ends above it
+        rows = []
+        for tw, tx, ty in [(t, x, y) for t, x, y in words if t.lower() == "town"]:
+            name = next(((t, x, y) for t, x, y in words if abs(tx - x) < 90 and 40 < ty - y < 75), None)
+            if not name:
+                continue
+            th = next((t for t, x, y in words if abs(y - ty) < 6 and 0 < x - tx < 160 and t.isdigit()), None)
+            game = next((t for t, x, y in words if 15 < y - name[2] < 40 and 0 < x - name[1] < 140
+                         and len(t) > 2), "")
+            rows.append({"sc": name[0], "game": game, "th": int(th) if th else None, "xy": (name[1], name[2])})
+        return rows
+
+    def all_accounts(self):
+        """Every account on the Supercell ID panel, top to bottom, scrolling down for long lists (10+ accounts).
+        Returns (rows, the panel's last view)."""
+        seen, frame = {}, self.shot()
+        k = frame.shape[1] / 1920
+        for _ in range(8):
+            new = [r for r in self.list_accounts(frame) if r["sc"] not in seen]
+            for r in new:
+                seen[r["sc"]] = r
+            if not new or self._list_end:
+                break
+            self.adb.swipe(int(1620 * k), int(960 * k), int(1620 * k), int(620 * k), 700)  # inside the panel
+            self.sleep(1.2)
+            frame = self.shot()
+        return list(seen.values())
+
+    def tap_account(self, sc):
+        """Scroll the Supercell ID panel back to the top, then down until that account is on screen; tap it."""
+        f = self.shot()
+        k = f.shape[1] / 1920
+        if not any(r["sc"] == sc for r in self.list_accounts(f)):  # not on screen: back to the top first
+            for _ in range(4):
+                self.adb.swipe(int(1620 * k), int(600 * k), int(1620 * k), int(1000 * k), 400)
+            self.sleep(1.0)
+        for _ in range(8):
+            row = next((r for r in self.list_accounts(self.shot()) if r["sc"] == sc), None)
+            if row:
+                self.tap(row["xy"], 4.0)
+                return True
+            self.adb.swipe(int(1620 * k), int(960 * k), int(1620 * k), int(620 * k), 700)
+            self.sleep(1.2)
+        return False
+
+    @staticmethod
+    def same_game_name(a, b):
+        """Two OCR'd in-game names ('Geocoi2' / 'GeoCol2') are the same name: same digits, close spelling."""
+        n = lambda s: re.sub(r"[^a-z0-9]", "", s.lower().replace("i", "l").replace("0", "o"))
+        return bool(a and b) and re.sub(r"\D", "", a) == re.sub(r"\D", "", b) and \
+            difflib.SequenceMatcher(None, n(a), n(b)).ratio() >= 0.7
+
+    def account_key(self, row, rows, name):
+        """What this account's plans / scans are filed under: its in-game name - or, when another account on the
+        list has the same in-game name, 'name (Supercell ID)'. Moves old data filed under the bare name to it
+        when the Town Hall matches."""
+        if not any(r is not row and self.same_game_name(r["game"], row["game"]) for r in rows):
+            return None
+        key = f"{name} ({row['sc']})"
+        old = ((self.cfg.get("scans") or {}).get(name) or {}).get("home") or {}
+        if old and row["th"] and old.get("hall") == row["th"] and key not in (self.cfg.get("scans") or {}):
+            for part in ("scans", "plans", "bb_bonus_days"):
+                if name in (self.cfg.get(part) or {}):
+                    self.cfg[part][key] = self.cfg[part].pop(name)
+            for tag, n in list((self.cfg.get("account_tags") or {}).items()):
+                if n == name:
+                    self.cfg["account_tags"][tag] = key
+            save_config(self.cfg)
+            self.log(f"Two accounts are called '{name}': this one's planner data is now under '{key}'.", "ok")
+        return key
 
     def switch_account(self):
         """Settings cog -> blue switch button -> tap the next account on the Supercell ID list."""
@@ -2965,29 +3358,54 @@ class Bot:
         cog = self.find(frame, "settings_cog_button") or (int(1842 * k), int(765 * k))
         self.tap(cog, 2.0)
         sw = self.wait_for("switch_account_button", 5)
+        tag = settings_tag(self.shot()) if sw else None
+        sc_of = self.cfg.setdefault("sc_of_tag", {})
+        if tag and getattr(self, "_cur_sc", None):
+            if sc_of.get(tag) != self._cur_sc:
+                sc_of[tag] = self._cur_sc  # this account = that Supercell ID (exact, unlike the in-game name)
+                save_config(self.cfg)
+        elif tag:
+            self._cur_sc = next((sc for t, sc in sc_of.items() if same_tag(t, tag)), None)
         if not sw:
             return self.switch_fail("switch-account button not found")
         self.tap(sw, 2.5)
         if not self.wait_for("supercell_id_header", 6):
             return self.switch_fail("Supercell ID list didn't open")
-        accounts = self.list_accounts(self.shot())
+        rows = self.all_accounts()
         wanted = {a.strip().lower() for a in self.cfg["accounts"].split(",") if a.strip()}
         if wanted:
-            accounts = [a for a in accounts if a[0].lower() in wanted]
-        self._n_accounts = len(accounts)
-        if len(accounts) < 2:
-            return self.switch_fail(f"need 2+ accounts to rotate, found {[a[0] for a in accounts]}")
-        self._acc_idx = (self._acc_idx + 1) % len(accounts)
-        if accounts[self._acc_idx][0].lower() == (self._last_name or "").lower():  # that's the one we're on
-            self._acc_idx = (self._acc_idx + 1) % len(accounts)
-        name, xy = accounts[self._acc_idx]
+            rows = [r for r in rows if r["sc"].lower() in wanted]
+        self._n_accounts = len(rows)
+        if len(rows) < 2:
+            return self.switch_fail(f"need 2+ accounts to rotate, found {[r['sc'] for r in rows]}")
+        # the one we're on: known exactly after a switch; at the start, the row whose in-game name (and Town Hall,
+        # when two share a name) matches this account
+        scans = self.cfg.get("scans") or {}
+        acc = next((n for t, n in (self.cfg.get("account_tags") or {}).items() if same_tag(t, tag)), None)
+        hall = ((scans.get(acc or self._last_name) or {}).get("home") or {}).get("hall")
+        cur = next((i for i, r in enumerate(rows) if r["sc"] == getattr(self, "_cur_sc", None)), None)
+        if cur is None:
+            bare = re.sub(r" \(.*\)$", "", self._last_name or "")
+            if tag and acc is None:  # an account not seen before: not one of the known accounts' rows
+                known = {((scans.get(n) or {}).get("home") or {}).get("hall")
+                         for n in (self.cfg.get("account_tags") or {}).values()}
+                cur = next((i for i, r in enumerate(rows) if self.same_game_name(r["game"], bare)
+                            and r["th"] not in known), None)
+            else:
+                cur = next((i for i, r in enumerate(rows) if self.same_game_name(r["game"], bare)
+                            and (hall is None or r["th"] in (None, hall))), None)
+        self._acc_idx = ((cur if cur is not None else self._acc_idx) + 1) % len(rows)
+        row = rows[self._acc_idx]
+        name = row["sc"]
         self.log(f"Switching account -> {name}", "ok")
-        self._last_name, self._pre = None, None  # new account: re-read its name, don't mix its loot with the last
-        self.tap(xy, 4.0)
+        self._last_name, self._pre, self._sc_key, self._tag_ok = None, None, None, None  # new account: re-read its name
+        if not self.tap_account(name):
+            return self.switch_fail(f"couldn't find {name} on the Supercell ID list")
+        self._cur_sc = name
         end, backs = time.time() + 75, 0
         while time.time() < end:
             f = self.shot()
-            if self.find(f, "attack_button"):
+            if self.at_village(f):  # home OR Builder Base: an account opens on whichever village it was left on
                 self._switch_streak += 1
                 self._upgrade_backoff.clear()
                 self._bank_backoff.clear()
@@ -3001,7 +3419,10 @@ class Bot:
                         break
                     self.sleep(1.0)
                 self._last_name = self._last_name or name
-                self.emit("state", f"Home village ({name})")
+                self._sc_key = self.account_key(row, rows, self._last_name)  # two accounts with one in-game name
+                if self._sc_key:
+                    self._last_name = self._sc_key
+                self.emit("state", f"Home village ({self._last_name})")
                 return True
             if self.find(f, "wall_okay_button") or time.time() > end - 60 + 6 * (backs + 1):
                 self.adb.back()  # 'Welcome back' / news popups; Back never confirms anything
@@ -3044,9 +3465,10 @@ class Bot:
                     break
             return
         pts = [self.along(a, b, k, n) for k in range(n)]
-        # Raw touches can report success without reaching the game on some emulator builds. ADB input taps are
-        # slower, but use the same path as card selection and reliably reach the game.
-        gap = max(self.speed()[0], 0.05)
+        gap = self.speed()[0]
+        if fast_taps(self.adb, pts, gap):
+            return
+        gap = max(gap, 0.05)  # `input tap` fallback
         for i in range(0, n, 20):  # one shell call per 20 taps - fast, no round trip per troop
             chunk = pts[i:i + 20]
             self.adb.shell(f"; sleep {gap}; ".join(f"input tap {x} {y}" for x, y in chunk), timeout=10 + len(chunk))
@@ -3056,13 +3478,9 @@ class Bot:
         it), then every hero / siege machine / pet (one tap each)."""
         cards = cards or troop_bar(self.shot())  # the deploy's debug read, when there was one
         troops = [cd for cd in cards if cd[2] == "troop" and cd[3]]
-        spell_cards = [cd for cd in cards if cd[2] == "spell" and cd[3]]
-        spells = spell_cards if self.cfg["deploy_spells"] else []
-        singles = [cd for cd in cards if cd[2] == "single"]
-        if spell_cards and not self.cfg["deploy_spells"]:
-            self.log(f"Skipped {len(spell_cards)} spell type(s): spell deployment is disabled in Battle settings.",
-                     "warn")
-        if not troops and not singles and not spells:
+        spells = [cd for cd in cards if cd[2] == "spell" and cd[3]] if self.cfg["deploy_spells"] else []
+        singles = [cd for cd in cards if cd[2] in ("hero", "single")]
+        if not troops and not singles:
             return False
         fp = self.cfg["fixed_points"]
         if fp.get("spell_point"):  # their own line, if set
@@ -3076,13 +3494,16 @@ class Bot:
         for x, y, _, n in troops:  # every troop on the saved line - the camera pans to the same spot each battle
             self.tap((x, y), delay)
             self.drop(a, b, n, (x, y))
-        for k, (x, y, _, _) in enumerate(singles):  # heroes / siege spread evenly along same line
-            self.tap((x, y), delay)
-            self.tap(self.along(a, b, k, len(singles)), 0.1)
-        self._ability_cards = [(x, y) for x, y, _, _ in singles]  # tapping a deployed hero's card = its ability
-        self.log(f"Placement taps sent: {sum(cd[3] for cd in troops)} troops ({len(troops)} types), "
-                 f"{len(singles)} heroes/siege, {sum(cd[3] for cd in spells)} spells "
-                 f"({len(spells)} types).")
+        for k, (x, y, _, _) in enumerate(singles):  # heroes / siege spread evenly along the same line
+            if not fast_taps(self.adb, [(x, y)]) or not fast_taps(self.adb, [self.along(a, b, k, len(singles))]):
+                self.tap((x, y), delay)
+                self.adb.tap(*self.along(a, b, k, len(singles)))
+            self.sleep(0.1)
+        # tapping a deployed hero's card = its ability. Never the Clan Castle's: a siege machine's card would
+        # break it open early
+        self._ability_cards = [(x, y) for x, y, kind, _ in singles if kind == "hero"]
+        self.log(f"Auto-deployed {sum(cd[3] for cd in troops)} troops ({len(troops)} types), "
+                 f"{len(singles)} heroes/siege" + (f", {len(spells)} spell types." if spells else "."))
         return True
 
     def close_popups(self):
@@ -3101,7 +3522,7 @@ class Bot:
 
     # --- recovery ---
     def emulator_restart_allowed(self):
-        return self.cfg["watchdog_enabled"] and os.path.isfile(self.cfg["emulator_exe_path"])
+        return self.cfg["watchdog_enabled"] and emulator_path_ok(self.cfg["emulator_exe_path"])
 
     def launch_game(self):
         pkg, act = self.cfg["coc_package_name"], self.cfg["coc_activity_name"]
@@ -3182,16 +3603,20 @@ class Bot:
         """Buttons, drop lines and text boxes are all 1920x1080 pixels. The monitor doesn't matter (screenshots
         come from inside the emulator), but BlueStacks' own resolution does: set it back and restart BlueStacks."""
         h, w = frame.shape[:2]
-        conf = r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf"
+        conf = BS_CONF
         if getattr(self, "_res_fixed", False) or not self.emulator_restart_allowed() or not os.path.exists(conf):
             self.log(f"The emulator is {w}x{h} but must be 1920x1080: BlueStacks Settings > Display > "
-                     "1920x1080, DPI 240, then restart BlueStacks.", "err")
+                     + ("1920x1080, DPI 240" if IS_WIN else "Landscape 1920x1080")
+                     + ", then restart BlueStacks.", "err")
             self.sleep(60)
             return
         self._res_fixed = True
         self.log(f"The emulator is {w}x{h} - setting BlueStacks to 1920x1080 and restarting it.", "warn")
 
-        self.restart_emulator(while_closed=lambda: bs_conf_set({"fb_width": "1920", "fb_height": "1080", "dpi": "240"}))
+        # BlueStacks Air keeps its panel config in portrait (1080x1920) and rotates it for landscape.
+        want = ({"fb_width": "1920", "fb_height": "1080", "dpi": "240"} if IS_WIN
+                else {"fb_width": "1080", "fb_height": "1920", "dpi": "320"})
+        self.restart_emulator(while_closed=lambda: bs_conf_set(want))
 
     def restart_emulator(self, while_closed=None):
         now = time.time()
@@ -3203,8 +3628,15 @@ class Bot:
         exe = self.cfg["emulator_exe_path"]
         self.log("Restarting the emulator...", "err")
         self.adb.close_shell()
-        subprocess.run(["taskkill", "/IM", os.path.basename(exe), "/T", "/F"], capture_output=True,
-                       timeout=20, creationflags=NO_WINDOW)
+        if IS_MAC:
+            subprocess.run(["osascript", "-e", 'quit app "BlueStacks"'], capture_output=True, timeout=30)
+            self.sleep(5)
+            if process_running(exe):  # refused to quit politely
+                subprocess.run(["pkill", "-f", "BlueStacks.app/Contents/MacOS/BlueStacks"],
+                               capture_output=True, timeout=20)
+        else:
+            subprocess.run(["taskkill", "/IM", os.path.basename(exe), "/T", "/F"], capture_output=True,
+                           timeout=20, creationflags=NO_WINDOW)
         self.sleep(5)
         try:  # BlueStacks rewrites its conf on exit, so settings are changed only while it's closed
             bs_conf_set(GFX_PROFILES[min(int(self.cfg.get("gfx_profile", 0)), len(GFX_PROFILES) - 1)][1])
@@ -3212,7 +3644,13 @@ class Bot:
                 while_closed()
         except OSError as e:
             self.log(f"Couldn't change BlueStacks' settings: {e}", "err")
-        subprocess.Popen([exe, *self.cfg["emulator_launch_args"].split()], creationflags=0x00000008)  # detached
+        if IS_MAC:
+            args = ["open", "-a", "BlueStacks"]
+            if self.cfg["emulator_launch_args"].split():
+                args += ["--args", *self.cfg["emulator_launch_args"].split()]
+            subprocess.run(args, capture_output=True, timeout=30)
+        else:
+            subprocess.Popen([exe, *self.cfg["emulator_launch_args"].split()], **DETACHED)
         self.sleep(self.cfg["emulator_boot_wait"])
         end = time.time() + self.cfg["adb_ready_timeout"]
         while time.time() < end:
@@ -3239,28 +3677,63 @@ class Bot:
 # Phone view: read-only web page (live screen + stats), shared through the Anywhere link
 # ---------------------------------------------------------------------------
 PHONE_PAGE = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Loot Farmer</title><style>
-body{margin:0;background:#1c1c1c;color:#e6e6e6;font:15px system-ui,sans-serif;padding:14px}
-h1{font-size:20px;margin:0 0 2px}#state{color:#4cc38a;font-weight:600;margin-bottom:10px}
-img{width:100%;border-radius:10px;background:#141414;min-height:120px}
-.g{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:12px 0}
-.c{background:#2b2b2b;border-radius:10px;padding:10px}.c b{display:block;font-size:20px}
-.c span{color:#9a9a9a;font-size:12px;text-transform:uppercase}
-.gold{color:#f5c542}.elixir{color:#d77bff}
-#loot table{width:100%;border-collapse:collapse;margin-bottom:12px;font-size:13px}
-#loot td,#loot th{padding:6px;text-align:right;border-bottom:1px solid #333}#loot td:first-child,#loot th:first-child{text-align:left}
-#log{background:#141414;border-radius:10px;padding:10px;font:12px ui-monospace,monospace;white-space:pre-wrap}
-</style></head><body><h1>&#9876; Loot Farmer</h1><div id="state">&hellip;</div><img id="f">
-<div class="g" id="g"></div><div id="loot"></div><div id="log"></div><script>
-const T=[["battery","Battery"],["runtime","Runtime"],["attacks","Attacks"],["skipped","Skipped"],["walls","Walls"],
-["recoveries","Recoveries"],["errors","Errors"],["s_gold","Your gold","gold"],["s_elixir","Your elixir","elixir"],
-["upgrades","Upgrades"],["switches","Switches"],["b_gold","Base gold","gold"],["b_elixir","Base elixir","elixir"]];
-async function tick(){try{const s=await (await fetch("status"+location.search,{cache:"no-store"})).json();
-document.getElementById("state").textContent=s.state;
-document.getElementById("g").innerHTML=T.map(([k,l,c])=>`<div class="c"><span>${l}</span><b class="${c||""}">${s[k]??"-"}</b></div>`).join("");
-document.getElementById("log").textContent=s.log.join("\\n");
-const L=s.loot||[];document.getElementById("loot").innerHTML=L.length?"<table><tr><th>Account</th><th>Gold</th><th>/hr</th><th>Elixir</th><th>/hr</th><th>Dark</th><th>/hr</th></tr>"+L.map(r=>`<tr><td>${r[0]}</td><td class="gold">${r[1]}</td><td class="gold">${r[2]}</td><td class="elixir">${r[3]}</td><td class="elixir">${r[4]}</td><td>${r[5]}</td><td>${r[6]}</td></tr>`).join("")+"</table>":"";
-document.getElementById("f").src="frame.jpg"+location.search+"&t="+Date.now();}catch(e){document.getElementById("state").textContent="PC not reachable";}}
+<meta name="theme-color" content="#141414"><title>Loot Farmer</title><style>
+*{box-sizing:border-box}body{margin:0;background:#1c1c1c;color:#e6e6e6;font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
+.wrap{max-width:760px;margin:0 auto;padding:14px}
+header{display:flex;align-items:center;gap:10px;margin-bottom:12px}header img{height:42px}
+h1{font-size:19px;margin:0}.sub{color:#9a9a9a;font-size:12px}
+.pill{margin-left:auto;padding:6px 12px;border-radius:999px;font-weight:600;font-size:13px;background:#1f3a2c;color:#4cc38a;
+white-space:nowrap;max-width:46%;overflow:hidden;text-overflow:ellipsis}
+.pill.off{background:#3a1f1f;color:#ff6b6b}.pill.idle{background:#2b2b2b;color:#9a9a9a}
+#f{width:100%;border-radius:12px;background:#141414;min-height:140px;display:block}
+.row{display:grid;gap:8px;margin:10px 0}.r3{grid-template-columns:repeat(3,1fr)}.r2{grid-template-columns:repeat(2,1fr)}
+.r4{grid-template-columns:repeat(4,1fr)}
+.c{background:#2b2b2b;border-radius:12px;padding:10px;display:flex;align-items:center;gap:8px;min-width:0}
+.c img{height:28px;flex:none}.c .v{font-weight:700;font-size:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.c .l{color:#9a9a9a;font-size:11px;text-transform:uppercase;letter-spacing:.03em}
+.s{flex-direction:column;align-items:flex-start;gap:2px;padding:8px 10px}.s .v{font-size:16px}
+.gold{color:#f5c542}.elixir{color:#d77bff}.dark{color:#b9a3ff}
+h2{font-size:12px;color:#9a9a9a;text-transform:uppercase;letter-spacing:.05em;margin:16px 2px 6px}
+.card{background:#2b2b2b;border-radius:12px;padding:10px 12px}
+.acc{display:flex;align-items:center;gap:6px;padding:6px 0;border-bottom:1px solid #353535;flex-wrap:wrap}.acc:last-child{border:0}
+.acc b{flex:1 1 100%;font-size:14px}.acc span{display:flex;align-items:center;gap:3px;font-weight:600;font-size:13px;margin-right:8px}
+.acc img{height:16px}
+.wall{padding:6px 0;border-bottom:1px solid #353535}.wall:last-child{border:0}.wall b{font-size:14px}
+.wall .n{color:#f5c542;font-weight:600;font-size:13px}.wall .ok{color:#4cc38a;font-weight:600;font-size:13px}
+.wall .m{color:#9a9a9a;font-size:12px}
+#log{background:#141414;border-radius:12px;padding:10px;font:12px ui-monospace,Consolas,monospace;white-space:pre-wrap;
+max-height:260px;overflow:auto}
+@media(max-width:420px){.r4{grid-template-columns:repeat(2,1fr)}}
+</style></head><body><div class="wrap">
+<header><img id="logo"><div><h1>Loot Farmer</h1><div class="sub" id="mode">&hellip;</div></div>
+<div class="pill idle" id="state">&hellip;</div></header>
+<img id="f" alt="">
+<div class="row r3" id="rates"></div>
+<div class="row r2" id="store"></div>
+<div class="row r4" id="g"></div>
+<h2>Accounts this session</h2><div class="card" id="loot"></div>
+<h2>Walls</h2><div class="card" id="walls"></div>
+<h2>Activity</h2><div id="log"></div>
+</div><script>
+const Q=location.search, ic=n=>"ui/"+n+".png"+Q, $=id=>document.getElementById(id);
+$("logo").src=ic("king");
+const STATS=[["runtime","Runtime"],["attacks","Attacks","king"],["walls","Walls","wall"],["upgrades","Upgrades","hammer"],
+["switches","Switches","builder_icon"],["skipped","Skipped","shield"],["recoveries","Restarts"],["battery","Battery"]];
+async function tick(){try{const s=await (await fetch("status"+Q,{cache:"no-store"})).json();
+const st=$("state");st.textContent=s.state;st.className="pill"+(/idle|stopped/i.test(s.state)?" idle":/recover/i.test(s.state)?" off":"");
+$("mode").textContent=s.mode?"Mode: "+s.mode:"";
+const B=s.bb,I=k=>B&&k!="dark"?"b"+k:k;$("rates").className="row "+(B?"r2":"r3");
+const R=s.rates||{};$("rates").innerHTML=[["gold","gold"],["elixir","elixir"]].concat(B?[]:[["dark","dark"]]).map(([k,c])=>
+`<div class="c"><img src="${ic(I(k))}"><div style="min-width:0"><div class="v ${c}">${((R[k]||["—"])[0]).replace(" / h","").replace(/(\\.\\d)\\dM/,"$1M")}</div><div class="l">per hour</div><div class="l" style="text-transform:none">${((R[k]||["",""])[1]).replace(" this session"," total")}</div></div></div>`).join("");
+$("store").innerHTML=[["s_gold","gold","gold"],["s_elixir","elixir","elixir"]].map(([k,i,c])=>
+`<div class="c"><img src="${ic(I(i))}"><div class="v ${c}">${s[k]??"—"}</div></div>`).join("");
+$("g").innerHTML=STATS.map(([k,l,i])=>`<div class="c s"><div class="l">${i?`<img src="${ic(i)}" style="height:14px;vertical-align:-2px"> `:""}${l}</div><div class="v">${s[k]??"-"}</div></div>`).join("");
+const L=s.loot||[];$("loot").innerHTML=L.length?L.map(r=>`<div class="acc"><b>${r[0]}</b>
+<span class="gold"><img src="${ic(I("gold"))}">${r[1]}</span><span class="elixir"><img src="${ic(I("elixir"))}">${r[3]}</span>
+${B?"":`<span class="dark"><img src="${ic("dark")}">${r[5]}</span>`}<span><img src="${ic("king")}">${r[7]}</span></div>`).join(""):'<div class="sub">Shows up once farming starts.</div>';
+const W=s.walls_view||[];$("walls").innerHTML=W.length?W.map(w=>`<div class="wall"><b>${w[0]}</b><div class="${w[2]?"n":"ok"}">${w[1]}</div>${w[2]?`<div class="m">${w[2]}</div>`:""}</div>`).join(""):'<div class="sub">Scan an account in the planner to see its walls.</div>';
+$("log").textContent=(s.log||[]).join("\\n");
+$("f").src="frame.jpg"+Q+"&t="+Date.now();}catch(e){const st=$("state");st.textContent="PC not reachable";st.className="pill off";}}
 tick();setInterval(tick,1500);</script></body></html>"""
 
 
@@ -3279,6 +3752,13 @@ class PhoneView:
                     return
                 if path == "/frame.jpg":
                     body, ctype = view.jpeg, "image/jpeg"
+                elif re.fullmatch(r"/ui/[a-z_]+\.png", path):  # the page's Clash icons (wiki/ui)
+                    try:
+                        with open(os.path.join(WIKI_DIR, "ui", path[4:]), "rb") as fh:
+                            body, ctype = fh.read(), "image/png"
+                    except OSError:
+                        self.send_error(404)
+                        return
                 elif path == "/status":
                     body, ctype = json.dumps(view.status).encode(), "application/json"
                 else:
@@ -3299,7 +3779,13 @@ class PhoneView:
 
 
 def _pid_image(pid):
-    """Full exe path of a running process, or None if it isn't running (Windows)."""
+    """Executable path of a running process, or None if it isn't running."""
+    if IS_MAC:
+        try:
+            r = subprocess.run(["ps", "-p", str(int(pid)), "-o", "comm="], capture_output=True, text=True, timeout=5)
+            return r.stdout.strip() or None
+        except Exception:
+            return None
     k32 = ctypes.windll.kernel32
     h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
     if not h:
@@ -3327,31 +3813,53 @@ class Tunnel:
 
     def _alive(self, st):
         img = _pid_image(st.get("pid", 0)) if st else None
-        return bool(img and img.lower().endswith("cloudflared.exe") and st.get("port") == self.port)
+        return bool(img and os.path.basename(img).lower().startswith("cloudflared") and st.get("port") == self.port)
 
     def _start(self):
+        """Start cloudflared; the link only counts once the tunnel has REGISTERED with Cloudflare - the address is
+        printed before that, and a PC whose network blocks the connection would hand out a dead link. HTTP/2 over
+        TCP 443 gets through routers / firewalls / VPNs that block QUIC (UDP), cloudflared's default."""
+        if not self._local_ok():
+            log_file.warning(f"Phone view server isn't answering on port {self.port} - the Anywhere link would show "
+                             "a Cloudflare error. Is another program using that port?")
         with open(self.LOG, "w") as lf:
-            proc = subprocess.Popen([self.exe, "tunnel", "--no-autoupdate", "--url", f"http://localhost:{self.port}"],
+            proc = subprocess.Popen([self.exe, "tunnel", "--no-autoupdate", "--protocol", "http2",
+                                     "--url", f"http://localhost:{self.port}"],
                                     stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                    creationflags=0x00000008 | 0x00000200)  # DETACHED | NEW_PROCESS_GROUP
-        for _ in range(60):
+                                    **DETACHED_TUNNEL)  # detached: it outlives this app
+        url = None
+        for _ in range(90):
             time.sleep(1)
             try:
-                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", open(self.LOG, errors="replace").read())
+                text = open(self.LOG, errors="replace").read()
             except OSError:
-                m = None
-            if m:
-                st = {"pid": proc.pid, "url": m.group(), "port": self.port}
+                text = ""
+            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", text)
+            url = m.group() if m else url
+            if url and "Registered tunnel connection" in text:
+                st = {"pid": proc.pid, "url": url, "port": self.port}
                 with open(self.STATE, "w") as f:
                     json.dump(st, f)
                 return st
             if proc.poll() is not None:
                 break
-        log_file.warning("cloudflared didn't give a link: " + open(self.LOG, errors="replace").read()[-400:])
+        log_file.warning(("cloudflared got a link but never connected (network blocking it?): " if url else
+                          "cloudflared didn't give a link: ") + open(self.LOG, errors="replace").read()[-500:])
         proc.kill()
         return None
 
+    def _local_ok(self):
+        """The phone view server answers (403 without the key still means it's up)."""
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{self.port}/status", timeout=5).close()
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
+
     def _run(self):
+        unconfirmed = 0  # new links in a row that never answered a check
         try:
             st = json.load(open(self.STATE))
         except Exception:
@@ -3372,12 +3880,21 @@ class Tunnel:
                     # a brand-new name takes a few seconds to exist; opening it before that gets 'site can't be
                     # reached' cached in the browser, so only hand the link out once it answers
                     if st:
-                        for _ in range(18):  # up to ~90s
+                        for _ in range(24):  # up to ~2 min
                             if self._link_works(st["url"]):
+                                unconfirmed = 0
                                 break
                             time.sleep(5)
-                        else:  # can't confirm it (our own check may be what's failing): hand it out anyway
-                            log_file.warning(f"New Anywhere link {st['url']} didn't answer a check yet.")
+                        else:  # never answered: don't post a dead link - a fresh tunnel (twice), then give up
+                            unconfirmed += 1
+                            if unconfirmed <= 2:
+                                log_file.warning(f"New Anywhere link {st['url']} never answered - starting another.")
+                                self._kill(st)
+                                st = None
+                            else:  # our own check may be what's failing (no internet?): hand it out anyway
+                                log_file.warning(f"Anywhere link {st['url']} couldn't be confirmed - posting it "
+                                                 "anyway.")
+                                unconfirmed = 0
                     if not st:
                         time.sleep(30)
                         continue
@@ -3398,13 +3915,20 @@ class Tunnel:
 
     @staticmethod
     def _kill(st):
-        subprocess.run(["taskkill", "/PID", str(st["pid"]), "/F"], capture_output=True, creationflags=NO_WINDOW)
+        if IS_WIN:
+            subprocess.run(["taskkill", "/PID", str(st["pid"]), "/F"], capture_output=True, creationflags=NO_WINDOW)
+        else:
+            try:
+                os.kill(int(st["pid"]), 15)  # SIGTERM
+            except OSError:
+                pass
         time.sleep(1)
 
     @staticmethod
     def _link_works(url):
         """True: our server answers through the tunnel. False: Cloudflare says it's gone (name doesn't exist /
         530). None: can't tell (no internet, VPN reconnecting...) - never a reason to throw a working link away."""
+        import socket
         host = url.split("//", 1)[-1].split("/")[0]
         try:  # ask Cloudflare's DNS directly: a lookup through Windows would cache 'no such name' for minutes
             r = json.load(urllib.request.urlopen(urllib.request.Request(
@@ -3413,12 +3937,14 @@ class Tunnel:
             if r.get("Status") == 3 or (r.get("Status") == 0 and not r.get("Answer")):  # 3 = no such name
                 return False
         except Exception:
-            return None
+            pass  # that lookup service is blocked on some networks / antivirus: just try the link itself
         try:
             urllib.request.urlopen(url + "/status", timeout=15).close()
             return True
         except urllib.error.HTTPError as e:
             return e.code not in (502, 530, 1033)
+        except urllib.error.URLError as e:
+            return False if isinstance(e.reason, socket.gaierror) else None  # name doesn't exist = dead link
         except Exception:
             return None
 
@@ -3427,9 +3953,12 @@ class Tunnel:
         """Stop a background tunnel left running (used when the public link is turned off)."""
         try:
             st = json.load(open(Tunnel.STATE))
-            if (_pid_image(st["pid"]) or "").lower().endswith("cloudflared.exe"):
-                subprocess.run(["taskkill", "/PID", str(st["pid"]), "/F"], capture_output=True,
-                               creationflags=NO_WINDOW)
+            if os.path.basename(_pid_image(st["pid"]) or "").lower().startswith("cloudflared"):
+                if IS_WIN:
+                    subprocess.run(["taskkill", "/PID", str(st["pid"]), "/F"], capture_output=True,
+                                   creationflags=NO_WINDOW)
+                else:
+                    os.kill(int(st["pid"]), 15)  # SIGTERM
         except Exception:
             pass
 
@@ -3452,7 +3981,8 @@ def pan_view(adb, where, frame_w=1920, frame_h=1080):
         time.sleep(0.15)
 
 
-BS_CONF = r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf"
+BS_CONF = r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf" if IS_WIN else _first_path(
+    BS_CONF_MAC, os.path.expanduser("~/Library/Application Support/BlueStacks/bluestacks.conf")) or BS_CONF_MAC
 # Graphics setups to try, in order, when BlueStacks keeps crashing (typically on the game's loading clouds - a
 # graphics-driver crash, e.g. NVIDIA + Vulkan). 0 = leave BlueStacks as the user set it.
 GFX_PROFILES = [
@@ -3479,6 +4009,13 @@ def bs_conf_set(values):
 
 def process_running(exe):
     try:
+        if IS_MAC:
+            # BlueStacks Air's engine runs as /Applications/BlueStacks.app/Contents/MacOS/BlueStacks
+            if exe.rstrip("/").endswith(".app"):
+                cmd = ["pgrep", "-f", os.path.basename(exe.rstrip("/"))[:-4] + ".app/Contents/MacOS/"]
+            else:
+                cmd = ["pgrep", "-x", os.path.basename(exe)]
+            return bool(subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout.strip())
         out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {os.path.basename(exe)}", "/NH"], capture_output=True,
                              text=True, timeout=15, creationflags=NO_WINDOW).stdout
     except Exception:
@@ -3530,6 +4067,59 @@ def post_discord(cfg, text, files=()):
     log_file.warning("Discord post failed 5 times - giving up on this message.")
 
 
+SHORTCUT_PS = r"""
+param([string]$Bot, [string]$PyW, [string]$Ico, [string]$AppId)
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+[ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IPropertyStore { int GetCount(out uint c); int GetAt(uint i, out PROPERTYKEY k);
+  int GetValue(ref PROPERTYKEY k, out PROPVARIANT v); int SetValue(ref PROPERTYKEY k, ref PROPVARIANT v); int Commit(); }
+[StructLayout(LayoutKind.Sequential, Pack = 4)] public struct PROPERTYKEY { public Guid fmtid; public uint pid; }
+[StructLayout(LayoutKind.Explicit)] public struct PROPVARIANT { [FieldOffset(0)] public ushort vt; [FieldOffset(8)] public IntPtr p; }
+public static class Aumid {
+  [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+  static extern int SHGetPropertyStoreFromParsingName(string path, IntPtr bc, int flags, ref Guid iid, out IPropertyStore ps);
+  public static void Set(string lnk, string id) {
+    Guid iid = new Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"); IPropertyStore ps;
+    if (SHGetPropertyStoreFromParsingName(lnk, IntPtr.Zero, 2, ref iid, out ps) != 0) return;
+    PROPERTYKEY k = new PROPERTYKEY { fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), pid = 5 };
+    PROPVARIANT v = new PROPVARIANT { vt = 31, p = Marshal.StringToCoTaskMemUni(id) };
+    ps.SetValue(ref k, ref v); ps.Commit(); Marshal.ReleaseComObject(ps); } }
+'@
+$ws = New-Object -ComObject WScript.Shell
+$pinned = Join-Path $env:APPDATA "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
+$links = @((Join-Path ([Environment]::GetFolderPath("Desktop")) "Loot Farmer.lnk"),
+           (Join-Path ([Environment]::GetFolderPath("Programs")) "Loot Farmer.lnk"))
+if (Test-Path $pinned) { $links += Get-ChildItem $pinned -Filter *.lnk | ForEach-Object { $_.FullName } }
+foreach ($l in $links) {
+  $isOurs = $false
+  if (Test-Path $l) { $s = $ws.CreateShortcut($l); $isOurs = ($s.Arguments -like "*bot.py*") -or ($s.TargetPath -like "*bot.py") }
+  elseif ($l -notlike "$pinned*") { $isOurs = $true }  # desktop / Start menu: create it
+  if (-not $isOurs) { continue }
+  $s = $ws.CreateShortcut($l); $s.TargetPath = $PyW; $s.Arguments = '"' + $Bot + '"'
+  $s.WorkingDirectory = Split-Path $Bot; $s.IconLocation = $Ico; $s.Description = "Loot Farmer"; $s.Save()
+  [Aumid]::Set($l, $AppId); "ok $l"
+}
+"""
+
+
+def fix_shortcuts():
+    """Desktop + Start menu + pinned taskbar shortcuts that start this bot.py: the King icon and the app's taskbar
+    identity (so the running window groups under it, not under Python). Windows only; quietly does nothing else."""
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    ico = os.path.join(WIKI_DIR, "ui", "app.ico")
+    if os.name != "nt" or not os.path.isfile(pyw) or not os.path.isfile(ico):
+        return False
+    ps1 = os.path.join(tempfile.gettempdir(), "lootfarmer_shortcuts.ps1")
+    with open(ps1, "w", encoding="utf-8-sig") as f:
+        f.write(SHORTCUT_PS)
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-Bot",
+                        os.path.abspath(__file__), "-PyW", pyw, "-Ico", ico, "-AppId", APP_ID],
+                       capture_output=True, text=True, timeout=90, creationflags=NO_WINDOW)
+    log_file.info("shortcuts: " + (" | ".join(r.stdout.split()) or r.stderr.strip()[-300:]))
+    return r.returncode == 0
+
+
 def single_instance():
     """A machine-wide lock so only one Loot Farmer drives the emulator. Waits a few seconds first, so the
     Restart / Update buttons (new copy starts while the old one closes) still work. None = another is running."""
@@ -3550,6 +4140,7 @@ def single_instance():
 
 
 _TOUCH = {}
+TOUCH_TMP = "/data/local/tmp/lootfarmer_touch"  # scratch file for raw events on macOS (see touch_writer)
 
 
 def touch_device(adb):
@@ -3584,6 +4175,47 @@ def touch_ev(adb):
     return _TOUCH["ev"]
 
 
+def touch_panel_rotated(adb, W=1920, H=1080):
+    """True when the touch panel is a portrait panel shown rotated (BlueStacks Air on macOS: the emulator
+    reports a 1080x1920 panel and rotates it, so raw touch axes are swapped against the 1920x1080 screenshot).
+    BlueStacks 5 on Windows is natively landscape, so this is False there."""
+    if "rot" not in _TOUCH:
+        rot = False
+        try:
+            m = re.search(r"Physical size:\s*(\d+)x(\d+)", adb.shell("wm size", timeout=10))
+            if m:
+                pw, ph = int(m.group(1)), int(m.group(2))
+                rot = ph > pw and W > H  # portrait panel, landscape screen
+        except ADBError:
+            pass
+        _TOUCH["rot"] = rot
+    return _TOUCH["rot"]
+
+
+def touch_raw(x, y, mx, my, W=1920, H=1080, rotated=False):
+    """Screenshot (landscape) pixel -> raw touch-device coordinate."""
+    if rotated:  # panel turned 90 degrees: screen x runs along raw y, screen y is mirrored along raw x
+        return int((H - y) / H * mx), int(x / W * my)
+    return int(x / W * mx), int(y / H * my)
+
+
+def touch_writer(dev, ev):
+    """write_seq(events): the shell command that pushes them to the touch device as whole input_events.
+    Windows takes the decoded struct in one write. macOS/BlueStacks Air does NOT: toybox's base64 writes the
+    decoded bytes in 3-byte pieces and the kernel rejects anything that isn't a whole event (EINVAL), so every
+    pinch silently did nothing - decode to a file, then dd it out in exact event-sized blocks instead."""
+    size = len(ev(0, 0, 0))
+
+    def write(seq):
+        data = base64.b64encode(seq).decode()
+        if IS_MAC:
+            return (f"echo {data} | base64 -d > {TOUCH_TMP}; "
+                    f"dd if={TOUCH_TMP} of={dev} bs={size} 2>/dev/null")
+        return f"echo {data} | base64 -d > {dev}"  # Windows: the whole struct in one write
+
+    return write
+
+
 def zoom_out(adb, times=3, W=1920, H=1080, spread=((460, 900), (1460, 1020))):
     """Two-finger pinch (fingers moving together) = the game's zoom-out, sent straight to the touch device.
     Stops at the game's limit, so extra pinches are harmless. Raw input_event structs are written in one shell
@@ -3594,18 +4226,20 @@ def zoom_out(adb, times=3, W=1920, H=1080, spread=((460, 900), (1460, 1020))):
         return False
     dev, mx, my = d
     ev = touch_ev(adb)
+    rotated = touch_panel_rotated(adb, W, H)  # BlueStacks Air's panel is rotated: raw axes are swapped
+    write = touch_writer(dev, ev)
     for _ in range(times):
         steps = []
         for i in range(9):
             f, b = i / 8, b""
             for slot, (x0, x1) in enumerate(spread):
+                rx, ry = touch_raw(x0 + (x1 - x0) * f, 480, mx, my, W, H, rotated)  # both fingers mid-screen
                 b += ev(3, 47, slot) + (ev(3, 57, 100 + slot) if i == 0 else b"")
-                b += ev(3, 53, int((x0 + (x1 - x0) * f) / W * mx)) + ev(3, 54, int(480 / H * my))
+                b += ev(3, 53, rx) + ev(3, 54, ry)
             b += (ev(1, 330, 1) if i == 0 else b"") + ev(0, 0, 0)  # BTN_TOUCH down with the first frame
             steps.append(b)
         steps.append(ev(3, 47, 0) + ev(3, 57, -1) + ev(3, 47, 1) + ev(3, 57, -1) + ev(1, 330, 0) + ev(0, 0, 0))
-        adb.shell("; sleep 0.02; ".join(f"echo {base64.b64encode(s).decode()} | base64 -d > {dev}" for s in steps),
-                  timeout=30)
+        adb.shell("; sleep 0.02; ".join(write(s) for s in steps), timeout=30)
         time.sleep(0.3)
     return True
 
@@ -3620,9 +4254,13 @@ def fast_taps(adb, pts, gap=0.0, W=1920, H=1080):
     dev, mx, my = d
     ev = touch_ev(adb)
     raw = lambda bs: "".join(f"\\{x:03o}" for x in bs)  # printf escapes: exactly 3 octal digits a byte
+    rotated = touch_panel_rotated(adb, W, H)  # BlueStacks Air's panel is rotated: without this every tap lands wrong
     up = raw(ev(3, 47, 0) + ev(3, 57, -1) + ev(1, 330, 0) + ev(0, 0, 0))
-    cmds = [f"printf '{raw(ev(3, 47, 0) + ev(3, 57, 200 + i % 100) + ev(3, 53, int(x / W * mx)) + ev(3, 54, int(y / H * my)) + ev(1, 330, 1) + ev(0, 0, 0))}' >&3; sleep 0.02; printf '{up}' >&3"
-            for i, (x, y) in enumerate(pts)]
+    cmds = []
+    for i, (x, y) in enumerate(pts):
+        rx, ry = touch_raw(x, y, mx, my, W, H, rotated)
+        down = ev(3, 47, 0) + ev(3, 57, 200 + i % 100) + ev(3, 53, rx) + ev(3, 54, ry) + ev(1, 330, 1) + ev(0, 0, 0)
+        cmds.append(f"printf '{raw(down)}' >&3; sleep 0.02; printf '{up}' >&3")
     for i in range(0, len(cmds), 30):
         sep = f"; sleep {gap}; " if gap else "; "
         adb.shell(f"exec 3> {dev}; " + sep.join(cmds[i:i + 30]) + "; exec 3>&-", timeout=20 + gap * 30)
@@ -3630,7 +4268,7 @@ def fast_taps(adb, pts, gap=0.0, W=1920, H=1080):
 
 
 def battery():
-    """(percent, plugged_in) where the host exposes a battery reading."""
+    """(percent, plugged_in) where the host exposes a reading: pmset on macOS, GetSystemPowerStatus on Windows."""
     if sys.platform == "darwin":
         try:  # MacBooks expose battery state through pmset; desktops have no battery to report
             out = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True,
@@ -3656,6 +4294,12 @@ def battery():
 # UI
 # ---------------------------------------------------------------------------
 BG, CARD, MUTED, TEXT = "#1c1c1c", "#2b2b2b", "#9a9a9a", "#e6e6e6"
+SIDE, NAV_ON = "#141414", "#262b33"  # sidebar, selected page
+# what the mode picker shows: mode -> (title, one line, icon in wiki/ui)
+MODES = {"farm": ("Full farm", "Attacks, upgrades, walls", "king"), "loot": ("Loot only", "Just attack", "gold"),
+         "walls": ("Walls only", "Farm + buy walls", "wall"),
+         "bb_loot": ("BB loot", "Builder Base attacks", "bgold"),
+         "bb_farm": ("BB farm", "Builder Base + upgrades", "builderhall")}
 GREEN, AMBER, RED, BLUE, GOLD, PINK = "#4cc38a", "#e5b454", "#ff6b6b", "#57a6ff", "#f5c542", "#d77bff"
 LEVEL_COLORS = {"info": TEXT, "ok": GREEN, "warn": AMBER, "err": RED}
 UI_SCALE = 1.0  # set from the real DPI at startup so the layout isn't tiny on 150-200% displays
@@ -3721,7 +4365,7 @@ class DropLinePicker(tk.Toplevel):
                 self.cv.create_oval(x - r, y - r, x + r, y + r, outline="white", width=S(3), fill=col)
                 for dx, dy, c in ((2, 2, "black"), (0, 0, "white")):
                     self.cv.create_text(x + r + 6 + dx, y - r - 6 + dy, text=label, fill=c, anchor="w",
-                                        font=("Segoe UI", 12, "bold"))
+                                        font=(UI_FONT, 12, "bold"))
         self.info.config(text=f"Start: {tuple(a) if a else '-'}     End: {tuple(b) if b else '- (one spot only)'}")
 
     def click(self, e):
@@ -3810,7 +4454,7 @@ class PlannerTab(ttk.Frame):
         self.qtitle.pack(anchor="w")
         ttk.Label(q, text="Top = upgraded first. Done targets drop off\nby themselves.", style="Sub.TLabel").pack(
             anchor="w", pady=S(2, 6))
-        self.qbox = self._scroller(q, S(330))
+        self.qbox = self._scroller(q, S(290))
         ttk.Button(q, text="Clear this account's plan", command=self.clear).pack(anchor="w", pady=S(8, 0))
         # right: cards
         r = ttk.Frame(body)
@@ -3936,10 +4580,10 @@ class PlannerTab(ttk.Frame):
     # plain tk widgets inside the lists: themed ttk ones made each redraw take seconds
     def _lbl(self, parent, text="", bold=False, muted=False, size=10, **kw):
         return tk.Label(parent, text=text, bg=kw.pop("bg", CARD), fg=MUTED if muted else TEXT, anchor="w",
-                        font=("Segoe UI", size, "bold" if bold else "normal"), justify="left", **kw)
+                        font=(UI_FONT, size, "bold" if bold else "normal"), justify="left", **kw)
 
     def _chip(self, parent, text, cmd):
-        c = tk.Label(parent, text=text, bg="#3a3a3a", fg=TEXT, font=("Segoe UI", 9, "bold"), padx=S(7), pady=S(3),
+        c = tk.Label(parent, text=text, bg="#3a3a3a", fg=TEXT, font=(UI_FONT, 9, "bold"), padx=S(7), pady=S(3),
                      cursor="hand2")
         c.bind("<Button-1>", lambda e: cmd())
         return c
@@ -3983,9 +4627,12 @@ class PlannerTab(ttk.Frame):
         self._cards = {}
         self._empty = self._lbl(self.cards, "Nothing to show - scan the account first (or change the filter).",
                                 muted=True, bg=BG)
+        self.update_idletasks()
+        avail = self.cards.canvas.winfo_width()
+        self._ncols = 3 if avail >= S(1000) or avail <= 100 else 2  # 2 columns when the window is narrower
         for c in range(3):
-            self.cards.columnconfigure(c, weight=1, uniform="card")
-        self._card_w = self._col_width(self.cards.canvas.winfo_width())  # chips wrap inside it
+            self.cards.columnconfigure(c, weight=1 if c < self._ncols else 0, uniform="card" if c < self._ncols else "")
+        self._card_w = self._col_width(avail)  # chips wrap inside it
         for k in g:
             if k == "home:wall":
                 continue  # bought with gold/elixir, not builders: the dashboard's Walls card
@@ -4010,15 +4657,15 @@ class PlannerTab(ttk.Frame):
                       key=lambda k: (order.index(cards[k]["cat"]) if cards[k]["cat"] in order else 99,
                                      cards[k]["name"]))
         for n, k in enumerate(keys):
-            cards[k]["frame"].grid(row=n // 3, column=n % 3, sticky="nsew", padx=S(4), pady=S(4))
+            cards[k]["frame"].grid(row=n // self._ncols, column=n % self._ncols, sticky="nsew", padx=S(4), pady=S(4))
         if not keys:
             self._empty.grid(row=0, column=0, columnspan=3, sticky="w", pady=S(10))
         self.update_chips()
         self.cards.canvas.yview_moveto(0)
 
-    @staticmethod
-    def _col_width(avail):
-        return max(S(220), avail // 3 - S(12)) if avail > 100 else S(300)
+    def _col_width(self, avail):
+        cols = 3 if avail >= S(1000) or avail <= 100 else 2
+        return max(S(220), avail // cols - S(12)) if avail > 100 else S(300)
 
     def _resized(self, e):
         """Window resized (or first laid out): rebuild the cards at the new column width, once it settles."""
@@ -4037,16 +4684,16 @@ class PlannerTab(ttk.Frame):
             cv.create_image(pad, pad, image=ic, anchor="nw")
         tx = pad + S(64)
         y = cv.bbox(cv.create_text(tx, pad, text=e["name"], anchor="nw", fill=TEXT,
-                                   font=("Segoe UI", 11, "bold"), width=right - tx))[3]
-        y = cv.bbox(cv.create_text(tx, y + S(2), text=have, anchor="nw", fill=MUTED, font=("Segoe UI", 9),
+                                   font=(UI_FONT, 11, "bold"), width=right - tx))[3]
+        y = cv.bbox(cv.create_text(tx, y + S(2), text=have, anchor="nw", fill=MUTED, font=(UI_FONT, 9),
                                    width=right - tx))[3]
         if mx:
             y = cv.bbox(cv.create_text(tx, y + S(2), text=f"max {mx} at this hall", anchor="nw", fill=MUTED,
-                                       font=("Segoe UI", 9)))[3]
+                                       font=(UI_FONT, 9)))[3]
         y = max(y, pad + S(56)) + S(8)
         info = {"frame": cv, "chips": [], "x": None, "name": e["name"].lower(), "cat": category_of(k.split(":", 1)[1])}
         if cur is None or mx is None or cur >= mx:
-            y = cv.bbox(cv.create_text(pad, y, anchor="nw", fill=MUTED, font=("Segoe UI", 9), text=(
+            y = cv.bbox(cv.create_text(pad, y, anchor="nw", fill=MUTED, font=(UI_FONT, 9), text=(
                 "✓ maxed for this hall" if cur is not None and mx and cur >= mx else "(level couldn't be read)")))[3]
             cv.configure(height=y + pad)
             return info
@@ -4055,7 +4702,7 @@ class PlannerTab(ttk.Frame):
         def chip(text, cmd, line):
             line = max(line, row[0])  # stay on the row an earlier chip wrapped to
             t = cv.create_text(x[0] + S(7), line + S(3), text=text, anchor="nw", fill=TEXT,
-                               font=("Segoe UI", 9, "bold"))
+                               font=(UI_FONT, 9, "bold"))
             x0, y0, x1, y1 = cv.bbox(t)
             if x1 + S(7) > right and x[0] > pad + S(60):  # no room left on this row: wrap under it
                 cv.move(t, pad - x[0], y1 - y0 + S(12))
@@ -4071,7 +4718,7 @@ class PlannerTab(ttk.Frame):
             return r, t
         line = y
         x[0] = cv.bbox(cv.create_text(pad, line + S(3), text="Up to:", anchor="nw", fill=MUTED,
-                                      font=("Segoe UI", 9)))[2] + S(6)
+                                      font=(UI_FONT, 9)))[2] + S(6)
         targets = list(range(cur + 1, mx + 1))
         many = len(targets) > 6  # heroes have dozens of levels: next few + max, plus a picker for any level
         if many:
@@ -4083,7 +4730,7 @@ class PlannerTab(ttk.Frame):
         y = cv.bbox("all")[3] + S(8)
         if many:
             x[0] = cv.bbox(cv.create_text(pad, y + S(3), text="or level", anchor="nw", fill=MUTED,
-                                          font=("Segoe UI", 9)))[2] + S(6)
+                                          font=(UI_FONT, 9)))[2] + S(6)
             sp = tk.Spinbox(cv, from_=cur + 1, to=mx, width=5, bg="#3a3a3a", fg=TEXT, buttonbackground=CARD,
                             relief="flat", insertbackground=TEXT)
             x[0] = cv.bbox(cv.create_window(x[0], y, window=sp, anchor="nw"))[2] + S(6)
@@ -4222,8 +4869,12 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         global UI_SCALE
-        UI_SCALE = self.winfo_fpixels("1i") / 96
+        UI_SCALE = 1.0 if IS_MAC else self.winfo_fpixels("1i") / 96  # Tk reports 72 dpi on macOS
         self.title("Loot Farmer")
+        try:  # the King on the title bar + taskbar (same as the Start menu / desktop shortcut)
+            self.iconbitmap(default=os.path.join(WIKI_DIR, "ui", "app.ico"))
+        except tk.TclError:
+            pass
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{min(S(1240), int(sw * .92))}x{min(S(800), int(sh * .85))}+{int(sw * .04)}+{int(sh * .03)}")
         self.minsize(min(S(1060), int(sw * .8)), min(S(680), int(sh * .7)))
@@ -4248,7 +4899,7 @@ class App(tk.Tk):
             key, port = self.cfg["phone_view_key"], self.cfg["phone_view_port"]
             try:
                 self.phone = PhoneView(port, key)
-                exe = os.path.join(BASE_DIR, "cloudflared.exe")
+                exe = cf_exe()
                 if self.cfg["public_link_enabled"] and os.path.isfile(exe):
                     self.tunnel = Tunnel(exe, port, lambda url: self.ui(lambda: self._public_url(url)))
                 else:
@@ -4263,6 +4914,12 @@ class App(tk.Tk):
         if warn:
             self.log(warn, "warn")
         self.bg(self._initial_connect)
+        if self.cfg.get("shortcuts_v") != APP_VERSION:  # after an update: shortcuts get the King icon
+            def shortcuts():
+                if fix_shortcuts():
+                    self.cfg["shortcuts_v"] = APP_VERSION
+                    save_config(self.cfg)
+            self.bg(shortcuts)
         self.after(3000, self._update_tick)
 
     # --- helpers ---
@@ -4287,16 +4944,21 @@ class App(tk.Tk):
 
     def _styles(self):
         s = ttk.Style(self)
-        f = "Segoe UI Variable Display" if "Segoe UI Variable Display" in self.tk.call("font", "families") else "Segoe UI"
+        f = UI_FONT
+        if IS_WIN and "Segoe UI Variable Display" in self.tk.call("font", "families"):
+            f = "Segoe UI Variable Display"
+        self._font = f
+        s.layout("Hidden.TNotebook.Tab", [])  # pages switch from the sidebar, not a tab row
+        s.configure("Hidden.TNotebook", borderwidth=0)
         s.configure("Title.TLabel", font=(f, 20, "bold"))
-        s.configure("Sub.TLabel", font=("Segoe UI", 10), foreground=MUTED)
-        s.configure("CardTitle.TLabel", font=("Segoe UI", 9, "bold"), foreground=MUTED)
+        s.configure("Sub.TLabel", font=(UI_FONT, 10), foreground=MUTED)
+        s.configure("CardTitle.TLabel", font=(UI_FONT, 9, "bold"), foreground=MUTED)
         s.configure("CardValue.TLabel", font=(f, 22, "bold"))
         s.configure("Big.TLabel", font=(f, 15, "bold"))
         s.configure("Res.TLabel", font=(f, 17, "bold"))
         s.configure("Muted.TLabel", foreground=MUTED)
-        s.configure("Pill.TLabel", font=("Segoe UI", 10, "bold"))
-        s.configure("Start.Accent.TButton", font=("Segoe UI", 11, "bold"), padding=S(22, 9))
+        s.configure("Pill.TLabel", font=(UI_FONT, 10, "bold"))
+        s.configure("Start.Accent.TButton", font=(UI_FONT, 11, "bold"), padding=S(22, 9))
         s.configure("Treeview", rowheight=S(30))
 
     def card(self, parent, title, **grid):
@@ -4309,7 +4971,7 @@ class App(tk.Tk):
     def text_widget(self, parent, height):
         t = tk.Text(parent, height=height, bg="#141414", fg=TEXT, insertbackground=TEXT, relief="flat",
                     font=("Cascadia Mono", 9) if "Cascadia Mono" in self.tk.call("font", "families")
-                    else ("Consolas", 9), padx=S(10), pady=S(8), wrap="word", borderwidth=0, highlightthickness=0)
+                    else (MONO_FONT, 9), padx=S(10), pady=S(8), wrap="word", borderwidth=0, highlightthickness=0)
         for lvl, col in LEVEL_COLORS.items():
             t.tag_configure(lvl, foreground=col)
         t.tag_configure("ts", foreground="#6b6b6b")
@@ -4317,65 +4979,132 @@ class App(tk.Tk):
         return t
 
     # --- layout ---
+    # --- layout ---
+    def ui_icon(self, name, size):
+        """A Clash icon from wiki/ui/ (from the wiki) at that height, cached; None if missing."""
+        cache = self.__dict__.setdefault("_ui_icons", {})
+        if (name, size) not in cache:
+            try:
+                im = Image.open(os.path.join(WIKI_DIR, "ui", f"{name}.png")).convert("RGBA")
+                im = im.resize((max(1, round(im.width * size / im.height)), size), Image.LANCZOS)
+                cache[(name, size)] = ImageTk.PhotoImage(im)
+            except Exception:
+                cache[(name, size)] = None
+        return cache[(name, size)]
+
     def _build(self):
-        head = ttk.Frame(self, padding=S(24, 18, 24, 6))
-        head.pack(fill="x")
-        left = ttk.Frame(head)
-        left.pack(side="left")
-        ttk.Label(left, text="⚔  Loot Farmer", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(left, text="Clash of Clans  ·  unattended resource farming", style="Sub.TLabel").pack(anchor="w")
-        if self.phone:
-            self.public_label = ttk.Label(left, text="🌍  Anywhere link: starting…" if self.tunnel else
-                                          "🌍  Anywhere link: add cloudflared.exe next to bot.py",
-                                          style="Sub.TLabel", foreground=BLUE if self.tunnel else MUTED,
-                                          cursor="hand2")
-            self.public_label.pack(anchor="w")
-            self.public_label.bind("<Button-1>", lambda e: self.public_url and self._copy(
-                self.public_url, "Anywhere link"))
-        rep = ttk.Label(left, text="🐞  Send debug report to Discord", style="Sub.TLabel", foreground=BLUE,
-                        cursor="hand2")
-        rep.pack(anchor="w")
-        rep.bind("<Button-1>", lambda e: self.send_report("sent by hand"))
-        ver = ttk.Label(left, text=f"🕘  Version {APP_VERSION} - switch version", style="Sub.TLabel", foreground=BLUE,
-                        cursor="hand2")
-        ver.pack(anchor="w")
-        ver.bind("<Button-1>", lambda e: self.pick_version())
+        """Sidebar (navigation + connection + links) | main area: mode picker + Start, then the page."""
+        side = tk.Frame(self, bg=SIDE, width=S(236))
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        logo = tk.Frame(side, bg=SIDE)
+        logo.pack(fill="x", padx=S(16), pady=S(18, 14))
+        tk.Label(logo, image=self.ui_icon("king", S(44)), bg=SIDE).pack(side="left")
+        lt = tk.Frame(logo, bg=SIDE)
+        lt.pack(side="left", padx=S(10, 0))
+        tk.Label(lt, text="Loot Farmer", bg=SIDE, fg=TEXT, font=(self._font, 15, "bold")).pack(anchor="w")
+        tk.Label(lt, text=f"version {APP_VERSION}", bg=SIDE, fg=MUTED, font=(UI_FONT, 9)).pack(anchor="w")
 
-        right = ttk.Frame(head)
-        right.pack(side="right")
-        self.start_btn = ttk.Button(right, text="▶  Start farming", style="Start.Accent.TButton",
-                                    command=self.toggle, width=18)
-        self.start_btn.pack(side="right", padx=S(14, 0))
-        ttk.Button(right, text="⟳  Restart", command=self.restart_app).pack(side="right", padx=S(10, 0))
-        self.update_btn = ttk.Button(left, text="⬆  Update available - click to update", style="Accent.TButton",
-                                     command=self.do_update)  # under the title: the right-hand row is full
+        self.nav = {}
+        for page, label, icon in (("Dashboard", "Dashboard", "trophy"), ("Upgrade planner", "Upgrade planner", "builder"),
+                                  ("Setup", "Setup", "hammer"), ("Settings", "Settings", "lab"),
+                                  ("Log", "Activity log", "xp")):
+            row = tk.Frame(side, bg=SIDE, cursor="hand2", padx=S(12), pady=S(7))
+            row.pack(fill="x", padx=S(8), pady=S(1))
+            ic = tk.Label(row, image=self.ui_icon(icon, S(26)), bg=SIDE, width=S(30))
+            ic.pack(side="left")
+            tx = tk.Label(row, text=label, bg=SIDE, fg=TEXT, font=(UI_FONT, 11), anchor="w")
+            tx.pack(side="left", padx=S(10, 0))
+            for w in (row, ic, tx):
+                w.bind("<Button-1>", lambda e, p=page: self.nb.select(self.tabs[p]))
+            self.nav[page] = (row, ic, tx)
+
+        foot = tk.Frame(side, bg=SIDE)
+        foot.pack(side="bottom", fill="x", padx=S(16), pady=S(14))
+        self.update_btn = ttk.Button(foot, text="⬆  Update available", style="Accent.TButton", command=self.do_update)
         self._update = None  # shown only when GitHub has a newer version
-        self.loot_btn = ttk.Button(right, text="💰  Loot only", command=lambda: self.toggle("loot"))
-        self.loot_btn.pack(side="right", padx=S(10, 0))
-        self.wall_btn = ttk.Button(right, text="🧱  Walls only", command=lambda: self.toggle("walls"))
-        self.wall_btn.pack(side="right", padx=S(10, 0))
-        self.pill = ttk.Label(right, text="●  Connecting…", style="Pill.TLabel", foreground=AMBER)
-        self.batt_label = ttk.Label(right, text="", style="Pill.TLabel", foreground=MUTED)
-        self.batt_label.pack(side="right", padx=S(4, 10))
-        self._batt_t, self._batt_warned = 0.0, False
-        self.pill.pack(side="right", padx=S(14))
-        ttk.Button(right, text="↻", width=3, command=lambda: self.bg(self._initial_connect)).pack(side="right")
-        self.dev_combo = ttk.Combobox(right, width=15, state="readonly")
-        self.dev_combo.pack(side="right", padx=S(6))
-        self.dev_combo.bind("<<ComboboxSelected>>", self._device_chosen)
 
-        nb = self.nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=S(20), pady=S(8, 18))
-        tabs = {}
+        def link(text, cmd, color=BLUE):
+            lb = tk.Label(foot, text=text, bg=SIDE, fg=color, font=(UI_FONT, 9), cursor="hand2", anchor="w")
+            lb.pack(fill="x", pady=S(1))
+            lb.bind("<Button-1>", lambda e: cmd())
+            return lb
+        if self.phone:
+            self.public_label = link("🌍  Anywhere link: starting…" if self.tunnel else "🌍  Anywhere link: off",
+                                     lambda: self.public_url and self._copy(self.public_url, "Anywhere link"),
+                                     BLUE if self.tunnel else MUTED)
+        link("🐞  Send debug report", lambda: self.send_report("sent by hand"))
+        link("🕘  Switch version", self.pick_version)
+        link("⟳  Restart the app", self.restart_app)
+        tk.Frame(foot, bg="#2a2a2a", height=1).pack(fill="x", pady=S(10))
+        conn = tk.Frame(foot, bg=SIDE)
+        conn.pack(fill="x")
+        self.pill = tk.Label(conn, text="●  Connecting…", bg=SIDE, fg=AMBER, font=(UI_FONT, 10, "bold"))
+        self.pill.pack(side="left")
+        self.batt_label = tk.Label(conn, text="", bg=SIDE, fg=MUTED, font=(UI_FONT, 10, "bold"))
+        self.batt_label.pack(side="right")
+        self._batt_t, self._batt_warned = 0.0, False
+        dev = tk.Frame(foot, bg=SIDE)
+        dev.pack(fill="x", pady=S(6, 0))
+        self.dev_combo = ttk.Combobox(dev, width=16, state="readonly")
+        self.dev_combo.pack(side="left", fill="x", expand=True)
+        self.dev_combo.bind("<<ComboboxSelected>>", self._device_chosen)
+        ttk.Button(dev, text="↻", width=3, command=lambda: self.bg(self._initial_connect)).pack(side="left",
+                                                                                             padx=S(6, 0))
+
+        main = ttk.Frame(self)
+        main.pack(side="left", fill="both", expand=True)
+        top = ttk.Frame(main, padding=S(20, 16, 20, 4))
+        top.pack(fill="x")
+        self.start_btn = ttk.Button(top, text="▶  Start", style="Start.Accent.TButton", width=12,
+                                    command=lambda: self.toggle(self.mode_var.get()))
+        self.start_btn.pack(side="right", fill="y", padx=S(14, 0))
+        modes = tk.Frame(top, bg=BG)
+        modes.pack(side="left", fill="x", expand=True)
+        self.mode_var = tk.StringVar(value=self.cfg.get("ui_mode") if self.cfg.get("ui_mode") in MODES else "farm")
+        self.mode_cards = {}
+        for i, (m, (title, sub, icon)) in enumerate(MODES.items()):
+            modes.columnconfigure(i, weight=1, uniform="m")
+            card = tk.Frame(modes, bg=CARD, cursor="hand2", padx=S(6), pady=S(6), highlightthickness=S(2),
+                            highlightbackground=CARD, highlightcolor=CARD)
+            card.grid(row=0, column=i, sticky="nsew", padx=S(0 if i == 0 else 8, 0))
+            ic = tk.Label(card, image=self.ui_icon(icon, S(32)), bg=CARD)
+            ic.pack()
+            t = tk.Frame(card, bg=CARD)
+            t.pack(fill="x")
+            l1 = tk.Label(t, text=title, bg=CARD, fg=TEXT, font=(UI_FONT, 10, "bold"))
+            l1.pack()
+            l2 = tk.Label(t, text=sub, bg=CARD, fg=MUTED, font=(UI_FONT, 8))
+            l2.pack()
+            for w in (card, ic, t, l1, l2):
+                w.bind("<Button-1>", lambda e, m=m: self.pick_mode(m))
+            self.mode_cards[m] = card
+        self.pick_mode(self.mode_var.get(), save=False)
+
+        nb = self.nb = ttk.Notebook(main, style="Hidden.TNotebook")  # pages; the sidebar is the tab row
+        nb.pack(fill="both", expand=True, padx=S(20), pady=S(8, 16))
+        self.tabs = tabs = {}
         for name in ("Dashboard", "Upgrade planner", "Setup", "Settings", "Log"):
-            tabs[name] = ttk.Frame(nb, padding=S(14) if name != "Upgrade planner" else 0)
-            nb.add(tabs[name], text=f"  {name}  ")
+            tabs[name] = ttk.Frame(nb, padding=S(4) if name != "Upgrade planner" else 0)
+            nb.add(tabs[name], text=name)
         self.planner_tab, self.planner = tabs["Upgrade planner"], None
         nb.bind("<<NotebookTabChanged>>", self._tab_changed)
         self._build_dashboard(tabs["Dashboard"])
         self._build_setup(tabs["Setup"])
         self._build_settings(tabs["Settings"])
         self._build_log(tabs["Log"])
+
+    def pick_mode(self, m, save=True):
+        if self.thread:  # can't change mode while running
+            return
+        self.mode_var.set(m)
+        for k, card in self.mode_cards.items():
+            on = k == m
+            card.config(highlightbackground=BLUE if on else CARD, highlightcolor=BLUE if on else CARD)
+        self.start_btn.config(text="▶  Start")
+        if save and self.cfg.get("ui_mode") != m:
+            self.cfg["ui_mode"] = m
+            save_config(self.cfg)
 
     def _build_dashboard(self, tab):
         tab.columnconfigure(0, weight=3)
@@ -4384,16 +5113,21 @@ class App(tk.Tk):
         stats = ttk.Frame(tab)
         stats.grid(row=0, column=0, columnspan=2, sticky="ew", pady=S(0, 10))
         self.stat_labels = {}
-        for i, (key, title) in enumerate([("runtime", "Runtime"), ("attacks", "Attacks"),
-                                          ("skipped", "Bases skipped"), ("walls", "Walls bought"),
-                                          ("upgrades", "Upgrades"),
-                                          ("switches", "Switches"), ("recoveries", "Recoveries"),
-                                          ("errors", "Errors")]):
+        for i, (key, title, icon) in enumerate([("runtime", "Runtime", None), ("attacks", "Attacks", "king"),
+                                                ("skipped", "Skipped", "shield"), ("walls", "Walls", "wall"),
+                                                ("upgrades", "Upgrades", "hammer"), ("switches", "Switches", "builder_icon"),
+                                                ("recoveries", "Restarts", "battlemachine"), ("errors", "Errors", None)]):
             stats.columnconfigure(i, weight=1, uniform="s")
-            c = ttk.Frame(stats, style="Card.TFrame", padding=S(14, 8, 14, 8))  # compact: room for the cards below
+            c = tk.Frame(stats, bg=CARD, padx=S(12), pady=S(8))
             c.grid(row=0, column=i, sticky="nsew", padx=S(0 if i == 0 else 6, 0))
-            ttk.Label(c, text=title.upper(), style="CardTitle.TLabel").pack(anchor="w")
-            self.stat_labels[key] = ttk.Label(c, text="0" if key != "runtime" else "—", style="Big.TLabel")
+            t = c
+            hd = tk.Frame(c, bg=CARD)
+            hd.pack(anchor="w")
+            if icon:
+                tk.Label(hd, image=self.ui_icon(icon, S(20)), bg=CARD).pack(side="left", padx=S(0, 5))
+            tk.Label(hd, text=title.upper(), bg=CARD, fg=MUTED, font=(UI_FONT, 8, "bold")).pack(side="left")
+            self.stat_labels[key] = tk.Label(t, text="0" if key != "runtime" else "—", bg=CARD, fg=TEXT,
+                                             font=(self._font, 17, "bold"))
             self.stat_labels[key].pack(anchor="w")
 
         live = self.card(tab, "Live view", row=1, column=0, padx=S(0, 6))
@@ -4410,36 +5144,52 @@ class App(tk.Tk):
             save_config(self.cfg)
             self.log("Builder Base " + ("on: each account gets a visit (collect, cart, upgrades, daily stars)."
                                         if self.bb_var.get() else "off."), "ok")
-        ttk.Checkbutton(top, text="🏗  Builder Base", variable=self.bb_var, command=bb_toggled,
+        ttk.Checkbutton(top, text="Full farm visits the Builder Base", variable=self.bb_var, command=bb_toggled,
                         style="Switch.TCheckbutton").pack(side="right")
         self.preview = tk.Canvas(live, bg="#141414", highlightthickness=0, height=S(240))
         self.preview.pack(fill="both", expand=True)
         self.preview.create_text(10, 10, anchor="nw", text="The emulator screen appears here while farming.",
-                                 fill=MUTED, font=("Segoe UI", 10), tags="hint")
+                                 fill=MUTED, font=(UI_FONT, 10), tags="hint")
         self._photo = None
 
         side = ttk.Frame(tab)
         side.grid(row=1, column=1, sticky="nsew", padx=S(6, 0))
         side.columnconfigure(0, weight=1)
         side.rowconfigure(1, weight=1)
-        res = self.card(side, "Resources", row=0, column=0, pady=S(0, 12))
-        grid = ttk.Frame(res)
+        res = self.card(side, "Your storage", row=0, column=0, pady=S(0, 12))
+        self.res_card_title = res.winfo_children()[0]
+        grid = tk.Frame(res, bg=CARD)
         grid.pack(fill="x")
-        for i in range(4):
+        self.res_labels, self.res_icons = {}, {}
+        for i, (key, col, icon) in enumerate([("s_gold", GOLD, "gold"), ("s_elixir", PINK, "elixir")]):
             grid.columnconfigure(i, weight=1, uniform="r")
-        self.res_labels = {}
-        for i, (key, label, col) in enumerate([("s_gold", "Your gold", GOLD), ("s_elixir", "Your elixir", PINK),
-                                               ("b_gold", "Last base gold", GOLD),
-                                               ("b_elixir", "Last base elixir", PINK)]):
-            cell = ttk.Frame(grid)
-            cell.grid(row=0, column=i, sticky="ew")
-            ttk.Label(cell, text=label, style="Muted.TLabel").pack(anchor="w")
-            self.res_labels[key] = ttk.Label(cell, text="—", foreground=col, style="Res.TLabel")
-            self.res_labels[key].pack(anchor="w")
-        lc = self.card(side, "Loot this session (per account)", row=1, column=0)
-        self.loot_tree = self._tree(lc, ("Account", "Gold", "Gold/hr", "Elixir", "Elixir/hr", "Dark", "Dark/hr", "Att."),
-                                    (84, 56, 58, 56, 62, 46, 56, 34), 4)
-        self.loot_tree.pack(fill="both", expand=True)
+            cell = tk.Frame(grid, bg=CARD)
+            cell.grid(row=0, column=i, sticky="w")
+            self.res_icons[key[2:]] = tk.Label(cell, image=self.ui_icon(icon, S(32)), bg=CARD)
+            self.res_icons[key[2:]].pack(side="left", padx=S(0, 8))
+            self.res_labels[key] = tk.Label(cell, text="—", bg=CARD, fg=col, font=(self._font, 16, "bold"))
+            self.res_labels[key].pack(side="left")
+        lc = self.card(side, "This session", row=1, column=0)
+        rates = tk.Frame(lc, bg=CARD)
+        rates.pack(fill="x")
+        self.rate_labels, self.rate_icons, self.rate_cells, self.bb_view = {}, {}, {}, False
+        for i, (key, col, icon) in enumerate([("gold", GOLD, "gold"), ("elixir", PINK, "elixir"),
+                                              ("dark", "#b9a3ff", "dark")]):
+            rates.columnconfigure(i, weight=1, uniform="rt")
+            cell = self.rate_cells[key] = tk.Frame(rates, bg="#232323", padx=S(10), pady=S(8))
+            cell.grid(row=0, column=i, sticky="nsew", padx=S(0 if i == 0 else 6, 0))
+            self.rate_icons[key] = tk.Label(cell, image=self.ui_icon(icon, S(30)), bg="#232323")
+            self.rate_icons[key].pack(side="left", padx=S(0, 8))
+            t = tk.Frame(cell, bg="#232323")
+            t.pack(side="left")
+            per = tk.Label(t, text="—", bg="#232323", fg=col, font=(self._font, 15, "bold"))
+            per.pack(anchor="w")
+            tot = tk.Label(t, text="per hour", bg="#232323", fg=MUTED, font=(UI_FONT, 9))
+            tot.pack(anchor="w")
+            self.rate_labels[key] = (per, tot)
+        self.acc_box = tk.Frame(lc, bg=CARD)  # one line per account
+        self.acc_box.pack(fill="both", expand=True, pady=S(10, 0))
+        self.render_loot()
         wc = self.card(tab, "Walls", row=2, column=0, padx=S(0, 6), pady=S(12, 0))
         self.walls_cv = tk.Canvas(wc, bg=CARD, highlightthickness=0, height=S(40))
         self.walls_cv.pack(fill="x")
@@ -4597,7 +5347,7 @@ class App(tk.Tk):
         bar = ttk.Frame(tab)
         bar.pack(fill="x", pady=S(0, 10))
         ttk.Label(bar, text=f"Also saved to {LOG_FILE}", style="Muted.TLabel").pack(side="left")
-        ttk.Button(bar, text="Open log file", command=lambda: os.startfile(LOG_FILE)).pack(side="right")
+        ttk.Button(bar, text="Open log file", command=lambda: open_path(LOG_FILE)).pack(side="right")
         ttk.Button(bar, text="Clear", command=self._clear_log).pack(side="right", padx=S(8))
         self.full_log = self.text_widget(tab, 20)
         sb = ttk.Scrollbar(tab, command=self.full_log.yview)
@@ -4635,6 +5385,7 @@ class App(tk.Tk):
                     if self.adb.device in data:
                         self.dev_combo.set(self.adb.device)
                 elif kind == "storage":
+                    self.set_bb_view(data.pop("village", "home") == "builder")
                     for k, v in data.items():
                         if v is not None:
                             self.res_labels["s_" + k].config(text=f"{v:,}")
@@ -4642,7 +5393,7 @@ class App(tk.Tk):
                     self.loot_rows = data
                     self.render_loot()
                 elif kind == "base":
-                    for k, v in zip(("b_gold", "b_elixir"), data):
+                    for k, v in zip(("b_gold", "b_elixir"), data if "b_gold" in self.res_labels else ()):
                         self.res_labels[k].config(text="?" if v is None else f"{v:,}")
                 elif kind == "call":
                     data()
@@ -4675,6 +5426,10 @@ class App(tk.Tk):
             st = {k: lbl.cget("text") for k, lbl in {**self.stat_labels, **self.res_labels}.items()}
             st["battery"] = self.batt_label.cget("text").replace("🔋 ", "") or "-"
             st["loot"] = getattr(self, "loot_view", [])
+            st["rates"] = {k: [a.cget("text"), b.cget("text")] for k, (a, b) in self.rate_labels.items()}
+            st["walls_view"] = getattr(self, "walls_view", [])
+            st["bb"] = self.bb_view
+            st["mode"] = MODES[self.bot.mode if self.bot else self.mode_var.get()][0]
             st.update(state=self.state_label.cget("text"), log=list(self.recent))
             self.phone.status = st
         if self.started_at:
@@ -4683,8 +5438,8 @@ class App(tk.Tk):
         if self.thread and not self.thread.is_alive():
             self.thread = self.bot = None
             self.started_at = None
-            for btn, text in self.mode_buttons().values():
-                btn.config(text=text, state="normal")
+            self.start_btn.config(state="normal")
+            self.pick_mode(self.mode_var.get(), save=False)
 
     def _append_log(self, level, msg):
         ts = time.strftime("%H:%M:%S ")
@@ -4725,7 +5480,7 @@ class App(tk.Tk):
             if new != self.public_url:
                 self.log(f"Anywhere link ready: {new}", "ok")
                 self.announce(f"🟢 **Loot Farmer v{APP_VERSION}** is running on "
-                              f"**{os.environ.get('COMPUTERNAME', 'a PC')}**\n{new}")
+                              f"**{host_name()}**\n{new}")
             self.public_url = new
             self.public_label.config(text="🌍  Anywhere link  (click to copy)", foreground=BLUE)
         else:
@@ -4788,9 +5543,7 @@ class App(tk.Tk):
     def toggle(self, mode="farm"):
         if self.thread:
             self.bot.stop_evt.set()
-            for btn, _ in self.mode_buttons().values():
-                btn.config(state="disabled")
-            self.mode_buttons()[self.bot.mode][0].config(text="Stopping…")
+            self.start_btn.config(text="Stopping…", state="disabled")
             return
         miss = self.missing_setup()
         if miss:
@@ -4812,16 +5565,29 @@ class App(tk.Tk):
         self.started_at = time.time()
         if self.public_url:  # the start-up post can be missed (PC asleep, network not up yet): send it again
             url = self.public_url
-            self.announce(f"▶️ Farming started on **{os.environ.get('COMPUTERNAME', 'a PC')}**\n{url}")
-        for m, (btn, _) in self.mode_buttons().items():
-            if m == mode:
-                btn.config(text={"farm": "■  Stop farming", "loot": "■  Stop looting", "walls": "■  Stop walls"}[m])
-            else:
-                btn.config(state="disabled")
+            self.announce(f"▶️ Farming started on **{host_name()}**\n{url}")
+        self.start_btn.config(text="■  Stop")
+        for k, card in self.mode_cards.items():
+            if k != mode:
+                card.config(highlightbackground=CARD)
 
-    def mode_buttons(self):
-        return {"farm": (self.start_btn, "▶  Start farming"), "loot": (self.loot_btn, "💰  Loot only"),
-                "walls": (self.wall_btn, "🧱  Walls only")}
+    def res_icon(self, k):
+        """'gold' -> 'bgold' etc. while the bot is on the Builder Base."""
+        return {"gold": "bgold", "elixir": "belixir"}.get(k, k) if self.bb_view else k
+
+    def set_bb_view(self, bb):
+        """Builder Base: Builder Gold / Builder Elixir icons everywhere, no Dark Elixir. Home: the normal ones."""
+        if bb == self.bb_view:
+            return
+        self.bb_view = bb
+        for k, lbl in self.res_icons.items():
+            lbl.config(image=self.ui_icon(self.res_icon(k), S(32)))
+        self.res_card_title.config(text="BUILDER BASE STORAGE" if bb else "YOUR STORAGE")
+        for k, lbl in self.rate_icons.items():
+            lbl.config(image=self.ui_icon(self.res_icon(k), S(30)))
+        self.rate_cells["dark"].master.columnconfigure(2, weight=0 if bb else 1, uniform="" if bb else "rt")
+        self.rate_cells["dark"].grid_remove() if bb else self.rate_cells["dark"].grid()
+        self.render_loot()
 
     def render_loot(self):
         """Per-account session loot + per-hour rates (loot / time since Start), with an all-accounts total."""
@@ -4834,12 +5600,30 @@ class App(tk.Tk):
             items.append(("All accounts", [sum(r[i] for _, r in items) for i in range(4)]))
         self.loot_view = [[acc, short(g), rate(g), short(e), rate(e), short(dk), rate(dk), n]
                           for acc, (g, e, dk, n) in items]
+        tot = [sum(r[i] for r in rows.values()) for i in range(4)]
+        for i, key in enumerate(("gold", "elixir", "dark")):
+            per, total = self.rate_labels[key]
+            per.config(text=f"{rate(tot[i])} / h" if hrs and rows else "—")
+            total.config(text=f"{short(tot[i])} this session" if rows else "per hour")
+        for w in self.acc_box.winfo_children():
+            w.destroy()
+        if not rows:
+            tk.Label(self.acc_box, text="Loot per account shows here once farming starts.", bg=CARD, fg=MUTED,
+                     font=(UI_FONT, 9)).pack(anchor="w")
+        for acc, (g, e, dk, n) in sorted(rows.items()):
+            row = tk.Frame(self.acc_box, bg=CARD, pady=S(3))
+            row.pack(fill="x")
+            tk.Label(row, text=acc, bg=CARD, fg=TEXT, font=(UI_FONT, 10, "bold"), width=12, anchor="w").pack(
+                side="left")
+            for v, icon, col in ((g, "gold", GOLD), (e, "elixir", PINK), (dk, "dark", "#b9a3ff"), (n, "king", TEXT)):
+                if icon == "dark" and self.bb_view:
+                    continue
+                tk.Label(row, image=self.ui_icon(self.res_icon(icon), S(18)), bg=CARD).pack(side="left", padx=S(10, 3))
+                tk.Label(row, text=str(v) if icon == "king" else short(v), bg=CARD, fg=col,
+                         font=(UI_FONT, 10, "bold")).pack(side="left")
         if hrs and hrs >= 0.05 and rows:  # from the first attack (~3 min): rough, sharpens as the session goes
             self.cfg["loot_rate"] = int(sum(r[0] + r[1] for r in rows.values()) / hrs)
             self.render_walls()
-        self.loot_tree.delete(*self.loot_tree.get_children())
-        for row in self.loot_view:
-            self.loot_tree.insert("", "end", values=row)
 
     def render_walls(self):
         """Per account: a bar of its walls by level (green = max for its Town Hall), what's left to pay and how
@@ -4857,7 +5641,8 @@ class App(tk.Tk):
             except Exception:
                 self._wall_icon = None
         tagged = set((self.cfg.get("account_tags") or {}).values())
-        y = 0
+        y, views = 0, []
+        self.walls_view = views  # the phone page shows the same lines
         for acc, bases in sorted((self.cfg.get("scans") or {}).items()):
             if tagged and acc not in tagged and difflib.get_close_matches(acc, tagged, 1, 0.75):
                 continue
@@ -4868,11 +5653,8 @@ class App(tk.Tk):
             total, x0 = sum(counts.values()), S(46)
             if self._wall_icon:
                 cv.create_image(0, y + S(2), image=self._wall_icon, anchor="nw")
-            cv.create_text(x0, y, anchor="nw", fill=TEXT, font=("Segoe UI", 10, "bold"),
+            cv.create_text(x0, y, anchor="nw", fill=TEXT, font=(UI_FONT, 10, "bold"),
                            text=f"{acc}   ·   Town Hall {sd.get('hall') or '?'}")
-            cv.create_text(W - S(4), y, anchor="ne", font=("Segoe UI", 10, "bold"),
-                           fill=GREEN if not todo else GOLD, text="✓  every wall is max" if not todo else
-                           f"{short(cost)} to go" + (f"   ·   ≈ {cost / rate:,.1f} h" if rate else ""))
             by, bh, x = y + S(24), S(16), x0
             for lvl in sorted(counts):
                 w = (W - x0 - S(4)) * counts[lvl] / total
@@ -4881,17 +5663,27 @@ class App(tk.Tk):
                                                                          int(0x6b - 0x17 * f))
                 cv.create_rectangle(x, by, x + w, by + bh, fill=col, width=0)
                 if w > S(26):
-                    cv.create_text(x + w / 2, by + bh / 2, text=str(lvl), fill="#111", font=("Segoe UI", 8, "bold"))
+                    cv.create_text(x + w / 2, by + bh / 2, text=str(lvl), fill="#111", font=(UI_FONT, 8, "bold"))
                 x += w
-            parts = "   ".join(f"lvl {lvl} ×{n}" for lvl, n in sorted(counts.items()) if lvl < (mx or 99))
-            eta = (f"hours at your farming rate of {short(rate)} gold + elixir / h" if rate else
-                   "start farming to estimate the hours") if todo else f"{total} walls at level {mx}"
-            cv.create_text(x0, by + bh + S(6), anchor="nw", fill=MUTED, font=("Segoe UI", 9),
-                           text=(f"{todo} of {total} walls to upgrade   ·   {parts}   ·   " if todo else "") + eta,
-                           width=W - x0)
+            hours = lambda v: f"≈ {v / rate:,.1f} h of farming" if rate else "start farming to estimate the hours"
+            if todo:  # headline: the next step - every wall at the lowest level up one level
+                low = min(counts)
+                n_low, step = counts[low], wiki_data()["home:wall"]["levels"][low]["cost"]
+                text = f"Next: {n_low} walls → level {low + 1}   ·   {short(n_low * step)}   ·   {hours(n_low * step)}"
+            else:
+                text = f"✓  all {total} walls at level {mx}"
+            head = cv.create_text(x0, by + bh + S(6), anchor="nw", font=(UI_FONT, 10, "bold"),
+                                  fill=GREEN if not todo else GOLD, width=W - x0, text=text)
+            views.append([f"{acc} · Town Hall {sd.get('hall') or '?'}", text, f"All {todo} to level {mx}: {short(cost)}"
+                          + (f" · {hours(cost)}" if rate else "") if todo else ""])
+            if todo:
+                cv.create_text(x0, cv.bbox(head)[3] + S(2), anchor="nw", fill=MUTED, font=(UI_FONT, 9),
+                               width=W - x0, text=f"All {todo} to level {mx} (max for this Town Hall): {short(cost)}"
+                               + (f"   ·   {hours(cost)}" if rate else "")
+                               + (f"   ·   at {short(rate)} gold + elixir / h" if rate else ""))
             y = cv.bbox("all")[3] + S(12)
         if not y:
-            cv.create_text(0, 0, anchor="nw", fill=MUTED, font=("Segoe UI", 9),
+            cv.create_text(0, 0, anchor="nw", fill=MUTED, font=(UI_FONT, 9),
                            text="Scan an account in the Upgrade planner to see its walls here.")
             y = S(24)
         cv.configure(height=y)
@@ -4901,8 +5693,8 @@ class App(tk.Tk):
             lbl.config(text="0" if k != "runtime" else "0h 00m")
         for lbl in self.res_labels.values():
             lbl.config(text="—")
-        self.loot_tree.delete(*self.loot_tree.get_children())
         self.loot_rows, self.loot_view = {}, []
+        self.render_loot()
 
     def _update_tick(self):
         """Check GitHub for a newer version now and every 30 minutes."""
@@ -4916,7 +5708,7 @@ class App(tk.Tk):
     def _show_update(self, man):
         if not self._update:
             self.log(f"Update available: version {man['version']} (you have {APP_VERSION}). Click ⬆ Update.", "ok")
-            self.update_btn.pack(anchor="w", pady=S(6, 0))
+            self.update_btn.pack(fill="x", pady=S(0, 10), before=self.update_btn.master.winfo_children()[1])
         self._update = man
 
     def do_update(self):
@@ -4945,6 +5737,11 @@ class App(tk.Tk):
     def _tab_changed(self, _e=None):
         """The planner tab is built the first time it's opened (50+ cards: no need to slow the start-up)."""
         tab = self.nb.nametowidget(self.nb.select())
+        for page, ws in self.nav.items():
+            on = self.tabs[page] is tab
+            for w in ws:
+                w.config(bg=NAV_ON if on else SIDE)
+            ws[2].config(font=(UI_FONT, 11, "bold" if on else "normal"))
         if tab is self.planner_tab:
             if self.planner is None:
                 self.planner = PlannerTab(self, tab)
@@ -5006,10 +5803,8 @@ class App(tk.Tk):
 
     def _restart_now(self):
         self._close()
-        exe = sys.executable
-        if os.name == "nt" and exe.lower().endswith("python.exe") and os.path.exists(exe[:-10] + "pythonw.exe"):
-            exe = exe[:-10] + "pythonw.exe"
-        subprocess.Popen([exe, os.path.abspath(__file__)], cwd=BASE_DIR, creationflags=0x00000008)
+        exe = python_gui_exe()
+        subprocess.Popen([exe, os.path.abspath(__file__)], cwd=BASE_DIR, **DETACHED)
 
     def send_report(self, reason, auto=False):
         """bot.log, the debug screenshots, the live screen and the non-secret settings to the Discord webhook.
@@ -5027,7 +5822,13 @@ class App(tk.Tk):
                     files.append(("bot.log", hide.sub("k=<hidden>", "".join(f.readlines()[-400:])).encode()))
             except OSError:
                 pass
-            for name in ("debug_deploy.png", "debug_deploy_after.png", "debug_wall.png", "debug_boat.png"):
+            try:  # what the Anywhere link's tunnel did (link problems)
+                with open(Tunnel.LOG, encoding="utf-8", errors="replace") as f:
+                    files.append(("cloudflared.log", "".join(f.readlines()[-80:]).encode()))
+            except OSError:
+                pass
+            for name in ("debug_deploy.png", "debug_deploy_after.png", "debug_wall.png", "debug_boat.png",
+                         "debug_unknown.png", "debug_export.png", "debug_upgrade.png"):
                 path = os.path.join(BASE_DIR, name)
                 if os.path.exists(path) and time.time() - os.path.getmtime(path) < 6 * 3600:
                     img = cv2.imread(path)
@@ -5041,7 +5842,7 @@ class App(tk.Tk):
             secret = ("groq_api_key", "phone_view_key", "discord_webhook")
             files.append(("settings.json", json.dumps({k: v for k, v in self.cfg.items() if k not in secret},
                                                       indent=1).encode()))
-            text = (f"🐞 **Debug report** from **{os.environ.get('COMPUTERNAME', 'a PC')}** (v{APP_VERSION}) - "
+            text = (f"🐞 **Debug report** from **{host_name()}** (v{APP_VERSION}) - "
                     f"{reason}\nState: {self.state_label.cget('text')}")
             if post_discord(self.cfg, text, files):
                 self.log(f"Debug report sent to Discord ({len(files)} files).", "ok")
@@ -5055,10 +5856,8 @@ class App(tk.Tk):
             return
         self.log("Restarting…")
         self._close()
-        exe = sys.executable
-        if os.name == "nt" and exe.lower().endswith("python.exe") and os.path.exists(exe[:-10] + "pythonw.exe"):
-            exe = exe[:-10] + "pythonw.exe"  # no console window
-        subprocess.Popen([exe, os.path.abspath(__file__)], cwd=BASE_DIR, creationflags=0x00000008)  # detached
+        exe = python_gui_exe()
+        subprocess.Popen([exe, os.path.abspath(__file__)], cwd=BASE_DIR, **DETACHED)  # detached
 
     def _close(self):
         if self.bot:
@@ -5383,6 +6182,25 @@ def selftest():
     print("selftest ok")
 
 
+PACKAGES = ("opencv-python", "Pillow", "numpy", "sv-ttk", "pytesseract", "groq")
+
+
+def bundle_python():
+    """A portable copy of this PC's Python (a normal Windows install runs from any folder) with only the bot's
+    modules in it, built in the temp folder. Returns its path."""
+    out = os.path.join(tempfile.gettempdir(), "lootfarmer_python")
+    shutil.rmtree(out, ignore_errors=True)
+    skip = {"site-packages", "test", "idlelib", "__pycache__", "Doc", "Scripts", "include", "libs", "Tools",
+            "ensurepip", "lib2to3", "tkinter/test", "turtledemo"}
+    shutil.copytree(sys.base_prefix, out, ignore=lambda d, names: [n for n in names if n in skip])
+    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-warn-script-location", "--target",
+                    os.path.join(out, "Lib", "site-packages"), "opencv-python-headless",  # no GUI/video: smaller
+                    *(p for p in PACKAGES if p != "opencv-python")], check=True)
+    for f in glob.glob(os.path.join(out, "Lib", "site-packages", "cv2", "opencv_videoio_ffmpeg*.dll")):
+        os.remove(f)  # video decoding: never used (30 MB)
+    return out
+
+
 def make_package():
     """LootFarmer_share.zip for a friend: bot + templates + setup, with a config stripped of anything personal
     (API key, phone-link secret, device, paths, account names). Setup.bat fills the paths in on their PC."""
@@ -5393,13 +6211,18 @@ def make_package():
                   auto_connect_target=DEFAULTS["auto_connect_target"], watchdog_enabled=False)
     out = os.path.join(BASE_DIR, "LootFarmer_share.zip")
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in ("bot.py", "setup.ps1", "Setup.bat", "README.txt"):
+        for f in ("bot.py", "setup.ps1", "Setup.bat", "setup_mac.sh", "README.txt", "readme-macos.md"):
             z.write(os.path.join(BASE_DIR, f), f"LootFarmer/{f}")
         for folder in ("Tesseract-OCR", "platform-tools"):  # bundled tools: nothing to install
             for root, _, files in os.walk(os.path.join(BASE_DIR, folder)):
                 for f in files:
                     full = os.path.join(root, f)
                     z.write(full, "LootFarmer/" + os.path.relpath(full, BASE_DIR).replace(os.sep, "/"))
+        py = bundle_python()  # Python + the bot's modules inside the folder: no install, no pip on their PC
+        for root, _, files in os.walk(py):
+            for f in files:
+                full = os.path.join(root, f)
+                z.write(full, "LootFarmer/python/" + os.path.relpath(full, py).replace(os.sep, "/"))
         for f in sorted(os.listdir(TEMPLATE_DIR)):
             if f.endswith(".png") and not f.startswith("old_"):
                 z.write(os.path.join(TEMPLATE_DIR, f), f"LootFarmer/templates/{f}")
@@ -5410,7 +6233,8 @@ def make_package():
     print(f"Created {out}")
 
 
-PUBLISHED = ("bot.py", "setup.ps1", "Setup.bat", "README.txt", ".gitignore", ".gitattributes")
+PUBLISHED = ("bot.py", "setup.ps1", "Setup.bat", "setup_mac.sh", "README.txt", "readme-macos.md", ".gitignore",
+            ".gitattributes")
 
 
 def published_files():
@@ -5422,6 +6246,9 @@ def published_files():
         icons = os.path.join(WIKI_DIR, "icons")
         files += sorted(f"wiki/icons/{f}" for f in (os.listdir(icons) if os.path.isdir(icons) else [])
                         if f.endswith(".png"))
+        ui = os.path.join(WIKI_DIR, "ui")  # the app's own Clash icons (sidebar, modes, tiles)
+        files += sorted(f"wiki/ui/{f}" for f in (os.listdir(ui) if os.path.isdir(ui) else [])
+                        if f.endswith((".png", ".ico")))
     return files
 
 
@@ -5550,6 +6377,10 @@ if __name__ == "__main__":
     else:
         try:  # crisp text on scaled (125-200%) Windows displays
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+        try:  # its own taskbar identity: the King icon, not Python's (the shortcuts carry the same ID)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
         except Exception:
             pass
         _instance = single_instance()
