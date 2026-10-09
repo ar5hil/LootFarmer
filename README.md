@@ -1,6 +1,6 @@
 # Loot Farmer - macOS Setup Guide (Apple silicon, BlueStacks Air)
 
-> On Windows? This file is Mac only - see [README.txt](README.txt) (steps 1-5) for the Windows setup.
+> On Windows? This file is Mac only - see [readme-windows.md](readme-windows.md) (steps 1-5) for the Windows setup.
 > Step 5 (start farming) works exactly the same on both.
 
 You need: an Apple-silicon Mac (M1 or newer), macOS 13+, internet, about 15 minutes,
