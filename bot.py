@@ -74,8 +74,8 @@ except ImportError:
 # Paths, constants, config
 # ---------------------------------------------------------------------------
 APP_VERSION = 32  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
-APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
-UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
+APP_ID = "ar5hil.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
+UPDATE_REPO = "ar5hil/LootFarmer"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -284,7 +284,7 @@ DEFAULTS = {
     "watchdog_enabled": True,
     "gfx_profile": 0,  # which GFX_PROFILES entry BlueStacks runs with; moved on automatically after crashes
     "emulator_exe_path": "",
-    "discord_webhook": "https://discord.com/api/webhooks/1541513961076293833/CtGCtGAaIJxf-MD68mBWdj6uZJ0Sf6x_E4Cj5bKIlmOsAoBgg91-1_IIqJ5s8V1olDQ7",  # the Anywhere link is posted here on every start
+    "discord_webhook": "https://discord.com/api/webhooks/1557953409120993289/4ulM8bwj-Gq18IROxwIgjqNYHkJpagYbElXrXXqJ1joHf1vEW49DHXCFwW4eUjQlrKH-",  # the Anywhere link is posted here on every start
     "emulator_launch_args": "",
     "coc_package_name": "com.supercell.clashofclans",
     "coc_activity_name": "com.supercell.titan.GameApp",
