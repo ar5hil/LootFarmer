@@ -73,7 +73,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 32  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 33  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "ar5hil.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "ar5hil/LootFarmer"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -251,6 +251,7 @@ DEFAULTS = {
     "surrender_damage_threshold": 50,
     "damage_confirm_count": 2,
     "battle_max_wait": 180,
+    "battle_countdown_wait": 1.0,
     "damage_stall_seconds": 20,
     "timer_poll_interval": 2.0,
     "hold_deploy": True,
@@ -334,6 +335,7 @@ SETTINGS = [
         ("damage_confirm_count", "Damage reads in a row", int),
         ("damage_stall_seconds", "Surrender if damage stalls for (s)", float),
         ("battle_max_wait", "Surrender after (s) regardless", float),
+        ("battle_countdown_wait", "Wait after good loot before deploying (s)", float),
         ("timer_poll_interval", "Damage check every (s)", float),
         ("hold_ms_per_troop", "Hold time per troop (ms)", int),
     ]),
@@ -1762,10 +1764,9 @@ class Bot:
         return False
 
     def attack_from_scout(self, gold, elixir):
-        if not self.wait_for_battle_start():
-            self.log("Battle countdown didn't finish within 45 seconds - waiting for the next screen before deploying.",
-                     "warn")
-            return False
+        wait = max(0, float(self.cfg.get("battle_countdown_wait", 1.0)))
+        if wait:
+            self.sleep(wait)
         return self.attack(gold, elixir)
 
     def on_scout(self, frame, prev):
