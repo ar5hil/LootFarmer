@@ -8,6 +8,11 @@ branched/forked oddly — the macOS branch briefly carried v17 then jumped to
 v19; there was never a released v18 with distinct changes beyond the security
 work listed.
 
+## v35 — 2026-10-10
+
+- New Hidden Treasure handling after returning home: the bot taps the chest (`treasure_chest`) 5-7 times at 0.3s gaps, waits 1.5s for the reveal, then clicks the green Continue (`continue_button`) to get back to the home village.
+- `back_to_village()` leaves the treasure popup alone (Back-pressing there could skip the reward) so the main-loop handlers open and collect it instead.
+
 ## v34 — 2026-10-10
 
 - New setting in Settings > Recovery: **auto_reconnect** (default on) — the bot clicks TRY AGAIN on the "Connection Lost" dialog (up to 3 attempts, 10s apart), then relaunches the game if it won't clear.

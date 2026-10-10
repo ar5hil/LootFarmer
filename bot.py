@@ -73,7 +73,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 34  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 35  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "ar5hil.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "ar5hil/LootFarmer"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -177,6 +177,8 @@ BUTTONS = [
     ("lab_picker_title", "Lab 'Choose what to upgrade' title  - upgrades"),
     ("guardians_title", "'Guardians' window title  - upgrades"),
     ("reload_game", "'Anyone there?' disconnect: RELOAD GAME  - recovery"),
+    ("treasure_chest", "Hidden Treasure popup: the chest to tap open  - treasure hunt"),
+    ("continue_button", "Hidden Treasure reward: green Continue  - treasure hunt"),
     ("bb_boat", "Boat's sail bubble (both villages)  - builder base"),
     ("bb_attack_button", "Builder Base Attack! (axes)  - builder base"),
     ("bb_find_now", "Builder Base Find Now!  - builder base"),
@@ -221,6 +223,8 @@ POINTS = [
 # (e.g. scouting shows Next AND End Battle, so Next must win).
 STATES = [
     ("return_home_button", "END"),
+    ("continue_button", "TREASURE_REWARD"),  # Hidden Treasure haul: Continue back to the village
+    ("treasure_chest", "TREASURE_CHEST"),  # Hidden Treasure popup: tap the chest to open it
     ("next_button", "SCOUT"),
     ("confirm_attack_button", "ARMY"),
     ("find_match_button", "MENU"),
@@ -235,6 +239,7 @@ STATES = [
 STATE_LABELS = {
     None: "Unknown screen", "HOME": "Home village", "MENU": "Attack menu", "ARMY": "Army screen",
     "SCOUT": "Scouting base", "BATTLE": "In battle", "CONFIRM": "Surrendering", "END": "Battle over",
+    "TREASURE_CHEST": "Hidden Treasure", "TREASURE_REWARD": "Treasure reward",
     "BBHOME": "Builder Base", "BBEND": "Builder Base battle over", "CONNECTION_LOST": "Connection Lost",
 }
 
@@ -1744,6 +1749,35 @@ class Bot:
     def on_end(self, frame, prev):
         self.tap(self.hits["return_home_button"], self.cfg["return_home_delay"])
 
+    def on_treasure_chest(self, frame, prev):
+        """Hidden Treasure popup after coming home: tap the chest 5-7 times
+        (0.3s apart), wait 1.5s for the reward reveal, then the main loop sees
+        TREASURE_REWARD and clicks Continue."""
+        chest = self.hits.get("treasure_chest")
+        if not chest:
+            return
+        self.log("Hidden Treasure - tapping the chest open.", "ok")
+        for _ in range(5):  # raw taps: self.tap() would add the tap delay on top
+            self.adb.tap(*chest)
+            self.sleep(0.3)
+        for _ in range(2):  # up to 2 extra taps if the reward hasn't revealed yet
+            self.hits = {}
+            frame = self.shot()
+            if self.find(frame, "continue_button") or not self.find(frame, "treasure_chest"):
+                break
+            self.adb.tap(*chest)
+            self.sleep(0.3)
+        self.sleep(1.5)
+
+    def on_treasure_reward(self, frame, prev):
+        """Hidden Treasure reward screen: only Continue matters - back to the home village."""
+        hit = self.hits.get("continue_button") or self.find(frame, "continue_button")
+        if hit:
+            self.log("Hidden Treasure collected.", "ok")
+            self.tap(hit, 2.0)
+        else:
+            self.sleep(1.0)
+
     def on_battle(self, frame, prev):
         left = [c for c in troop_bar(frame) if c[2] in ("troop", "spell") and c[3]]
         if left:
@@ -2849,6 +2883,8 @@ class Bot:
             f = self.shot()
             if self.reload_if_disconnected(f):
                 continue
+            if self.find(f, "treasure_chest") or self.find(f, "continue_button"):
+                return  # Hidden Treasure popup: the main loop's handlers open it, Back could skip the reward
             if (self.find(f, "wall_okay_button") or self.find(f, "lab_picker_title")
                     or not self.at_village(f)):  # dialogs / game windows (they hide Attack)
                 self.adb.back()
