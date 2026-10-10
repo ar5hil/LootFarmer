@@ -8,6 +8,12 @@ branched/forked oddly — the macOS branch briefly carried v17 then jumped to
 v19; there was never a released v18 with distinct changes beyond the security
 work listed.
 
+## v37 — 2026-10-10
+
+- New setting in Settings > Recovery: **auto_reload_inactivity** (default on) — the bot clicks RELOAD GAME on the "Anyone there?" Inactivity dialog (up to 3 attempts, 10s apart), then relaunches the game if it won't clear.
+- Inactivity dialog is detected before every other screen state (new `INACTIVITY` state: `inactivity_dialog` + `inactivity_reload_button` templates), so the overlay always wins over dimmed buttons behind it (e.g. Return Home on the Battle-over screen) — previously the bot sat stuck on "Battle over" tapping behind the popup.
+- `reload_game.png` template re-captured (the old one only scored 0.43 and never matched); `reload_if_disconnected()` now tries the new button first and respects the new toggle.
+
 ## v35 — 2026-10-10
 
 - New Hidden Treasure handling after returning home: the bot taps the chest (`treasure_chest`) 5-7 times at 0.3s gaps, waits 1.5s for the reveal, then clicks the green Continue (`continue_button`) to get back to the home village.

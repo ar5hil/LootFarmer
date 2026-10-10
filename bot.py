@@ -73,7 +73,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 36  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 37  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "ar5hil.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "ar5hil/LootFarmer"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -176,7 +176,9 @@ BUTTONS = [
     ("supercell_id_header", "Supercell ID panel logo  - accounts"),
     ("lab_picker_title", "Lab 'Choose what to upgrade' title  - upgrades"),
     ("guardians_title", "'Guardians' window title  - upgrades"),
-    ("reload_game", "'Anyone there?' disconnect: RELOAD GAME  - recovery"),
+    ("reload_game", "'Anyone there?' disconnect: RELOAD GAME (legacy)  - recovery"),
+    ("inactivity_dialog", "'Anyone there?' inactivity dialog box  - recovery"),
+    ("inactivity_reload_button", "Inactivity dialog: RELOAD GAME button  - recovery"),
     ("treasure_chest", "Hidden Treasure popup: the chest to tap open  - treasure hunt"),
     ("continue_button", "Hidden Treasure reward: green Continue  - treasure hunt"),
     ("bb_boat", "Boat's sail bubble (both villages)  - builder base"),
@@ -241,6 +243,7 @@ STATE_LABELS = {
     "SCOUT": "Scouting base", "BATTLE": "In battle", "CONFIRM": "Surrendering", "END": "Battle over",
     "TREASURE_CHEST": "Hidden Treasure", "TREASURE_REWARD": "Treasure reward",
     "BBHOME": "Builder Base", "BBEND": "Builder Base battle over", "CONNECTION_LOST": "Connection Lost",
+    "INACTIVITY": "Inactivity",
 }
 
 DEFAULTS = {
@@ -293,6 +296,7 @@ DEFAULTS = {
     "bank_post_spend_delay": 1.0,
     "watchdog_enabled": True,
     "auto_reconnect": True,  # click TRY AGAIN on Connection Lost dialog
+    "auto_reload_inactivity": True,  # click RELOAD GAME on the Inactivity ("Anyone there?") dialog
     "gfx_profile": 0,  # which GFX_PROFILES entry BlueStacks runs with; moved on automatically after crashes
     "emulator_exe_path": "",
     "discord_webhook": "https://discord.com/api/webhooks/1557953409120993289/4ulM8bwj-Gq18IROxwIgjqNYHkJpagYbElXrXXqJ1joHf1vEW49DHXCFwW4eUjQlrKH-",  # the Anywhere link is posted here on every start
@@ -380,6 +384,7 @@ SETTINGS = [
     ("Recovery", "Game relaunch is always on. Emulator restart needs the .exe path.", [
         ("watchdog_enabled", "Allow emulator restart", bool),
         ("auto_reconnect", "Click TRY AGAIN on Connection Lost dialog", bool),
+        ("auto_reload_inactivity", "Click RELOAD GAME on Inactivity dialog", bool),
         ("gfx_profile", "BlueStacks graphics fallback (0 = as set; rises after crashes)", int),
         ("emulator_exe_path", "Emulator .exe", str),
         ("emulator_launch_args", "Emulator launch args", str),
@@ -1492,6 +1497,14 @@ class Bot:
             if hit:
                 self.hits[name] = hit
                 return "CONNECTION_LOST"
+        # The Inactivity ("Anyone there?") dialog also sits on top of whatever
+        # screen is behind it (e.g. END with its Return Home button), so it
+        # must win the same way - otherwise the bot taps behind the dialog.
+        for name in ("inactivity_dialog", "inactivity_reload_button", "reload_game"):
+            hit = self.find(frame, name)
+            if hit:
+                self.hits[name] = hit
+                return "INACTIVITY"
         if self.find(frame, "wall_okay_button"):  # an Okay/Cancel dialog covers whatever screen is behind it
             return None
         for name, state in STATES:
@@ -1898,6 +1911,45 @@ class Bot:
 
         self.log("TRY AGAIN failed 3 times - relaunching the game.", "err")
         self.recover_game("Connection Lost would not clear after 3 retries")
+
+    def on_inactivity(self, frame, prev):
+        """Inactivity ("Anyone there?") dialog: click RELOAD GAME up to 3 times
+        (10s apart, like TRY AGAIN), then escalate to a game relaunch."""
+        if not self.cfg.get("auto_reload_inactivity", True):
+            self.log("Inactivity dialog detected but auto_reload_inactivity is disabled.", "warn")
+            self.sleep(5.0)  # don't spin the loop while the dialog sits on screen
+            return
+
+        for attempt in range(1, 4):
+            reload_btn = (self.hits.get("inactivity_reload_button")
+                          or self.find(frame, "inactivity_reload_button")
+                          or self.hits.get("reload_game")
+                          or self.find(frame, "reload_game"))
+            if reload_btn:
+                self.log(f"Inactivity - clicking RELOAD GAME (attempt {attempt}/3)", "warn")
+                self.tap(reload_btn, 1.0)
+            else:
+                dialog = self.hits.get("inactivity_dialog") or self.find(frame, "inactivity_dialog")
+                if not dialog:
+                    self.log("Inactivity dialog cleared.", "ok")
+                    return
+                self.log(f"Inactivity - RELOAD GAME not matched, tapping dialog (attempt {attempt}/3)", "warn")
+                self.tap(dialog, 1.0)
+            self.sleep(10.0)
+            frame = self.shot()
+            self.hits = {}
+            if (not self.find(frame, "inactivity_dialog")
+                    and not self.find(frame, "inactivity_reload_button")
+                    and not self.find(frame, "reload_game")):
+                state = self.detect(frame)
+                self.log(f"Reloaded ({STATE_LABELS[state]})." if state else
+                         "Inactivity dialog gone - resuming.", "ok")
+                self._launched_at = time.time()  # loading screens next: don't count them as stuck
+                return
+            self.log(f"Still on the Inactivity dialog after attempt {attempt}/3.", "warn")
+
+        self.log("RELOAD GAME failed 3 times - relaunching the game.", "err")
+        self.recover_game("Inactivity dialog would not clear after 3 retries")
 
     # --- Groq (AI vision) ---
     def groq_on(self, key):
@@ -2857,7 +2909,10 @@ class Bot:
 
     def reload_if_disconnected(self, frame):
         """'Anyone there? You have been disconnected due to inactivity' -> RELOAD GAME, then wait for it to load."""
-        hit = self.find(frame, "reload_game")
+        if not self.cfg.get("auto_reload_inactivity", True):
+            return False
+        hit = (self.find(frame, "inactivity_reload_button") or self.find(frame, "reload_game")
+               or self.find(frame, "inactivity_dialog"))
         if not hit:
             return False
         self.log("Disconnected for inactivity - reloading the game.", "warn")
