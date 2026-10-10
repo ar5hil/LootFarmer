@@ -73,7 +73,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 33  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 34  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "ar5hil.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "ar5hil/LootFarmer"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -156,6 +156,7 @@ def python_gui_exe():
 
 BUTTONS = [
     ("attack_button", "Attack! (home screen)"),
+    ("attack_button_treasure_hunt", "Attack! Treasure Hunt skin (home screen)"),
     ("find_match_button", "Find a Match"),
     ("confirm_attack_button", "Attack! (green, army screen)"),
     ("next_button", "Next (skip base)"),
@@ -225,13 +226,16 @@ STATES = [
     ("find_match_button", "MENU"),
     ("surrender_button", "BATTLE"),
     ("attack_button", "HOME"),
+    ("attack_button_treasure_hunt", "HOME"),  # seasonal Treasure Hunt skin of the home Attack! button
     ("bb_return_home", "BBEND"),   # started / restarted while on the Builder Base: finish up and sail home
     ("bb_attack_button", "BBHOME"),
+    # NOTE: connection_lost_* is checked first inside detect() (before the
+    # Okay/Cancel guard), so it must NOT also appear here - the guard would win.
 ]
 STATE_LABELS = {
     None: "Unknown screen", "HOME": "Home village", "MENU": "Attack menu", "ARMY": "Army screen",
     "SCOUT": "Scouting base", "BATTLE": "In battle", "CONFIRM": "Surrendering", "END": "Battle over",
-    "BBHOME": "Builder Base", "BBEND": "Builder Base battle over",
+    "BBHOME": "Builder Base", "BBEND": "Builder Base battle over", "CONNECTION_LOST": "Connection Lost",
 }
 
 DEFAULTS = {
@@ -283,6 +287,7 @@ DEFAULTS = {
     "bank_scroll_delay": 0.6,
     "bank_post_spend_delay": 1.0,
     "watchdog_enabled": True,
+    "auto_reconnect": True,  # click TRY AGAIN on Connection Lost dialog
     "gfx_profile": 0,  # which GFX_PROFILES entry BlueStacks runs with; moved on automatically after crashes
     "emulator_exe_path": "",
     "discord_webhook": "https://discord.com/api/webhooks/1557953409120993289/4ulM8bwj-Gq18IROxwIgjqNYHkJpagYbElXrXXqJ1joHf1vEW49DHXCFwW4eUjQlrKH-",  # the Anywhere link is posted here on every start
@@ -369,6 +374,7 @@ SETTINGS = [
     ]),
     ("Recovery", "Game relaunch is always on. Emulator restart needs the .exe path.", [
         ("watchdog_enabled", "Allow emulator restart", bool),
+        ("auto_reconnect", "Click TRY AGAIN on Connection Lost dialog", bool),
         ("gfx_profile", "BlueStacks graphics fallback (0 = as set; rises after crashes)", int),
         ("emulator_exe_path", "Emulator .exe", str),
         ("emulator_launch_args", "Emulator launch args", str),
@@ -1447,9 +1453,19 @@ class Bot:
 
     def find(self, frame, name):
         hit = self.v.find(frame, name, self.cfg["match_confidence"])
-        if hit and name in ("attack_button", "bb_attack_button") and not self.v.undimmed(frame, name, hit):
+        if hit and name in ("attack_button", "attack_button_treasure_hunt", "bb_attack_button") \
+                and not self.v.undimmed(frame, name, hit):
             return None  # a popup/panel is darkening the village: not really on the home screen
         return hit
+
+    def find_home_attack(self, frame):
+        """Either skin of the home village's Attack! button (regular or seasonal)."""
+        for name in ("attack_button", "attack_button_treasure_hunt"):
+            hit = self.find(frame, name)
+            if hit:
+                self.hits[name] = hit
+                return hit
+        return None
 
     def tap(self, xy, delay=None):
         self.adb.tap(*xy)
@@ -1464,6 +1480,13 @@ class Bot:
             self.sleep(poll)
 
     def detect(self, frame):
+        # Connection Lost sits on top of everything (and its dark overlay can
+        # trip other templates), so check it before the Okay/Cancel guard.
+        for name in ("connection_lost_dialog", "connection_lost_try_again_button"):
+            hit = self.find(frame, name)
+            if hit:
+                self.hits[name] = hit
+                return "CONNECTION_LOST"
         if self.find(frame, "wall_okay_button"):  # an Okay/Cancel dialog covers whatever screen is behind it
             return None
         for name, state in STATES:
@@ -1636,7 +1659,7 @@ class Bot:
 
     def attack_now(self):
         self._pre = self._cur  # storage right before this attack
-        self.tap(self.hits["attack_button"])
+        self.tap(self.hits.get("attack_button") or self.hits.get("attack_button_treasure_hunt"))
 
     def ambiguous(self):
         """True while the top-left name is one that two accounts share ('GeoCol2' and 'GeoCol2 (GeoCol2)') and
@@ -1808,6 +1831,39 @@ class Bot:
                 self._view.join(15)
             self._view = None  # the next base gets its own zoom + pan
             self.tap(hit, c["loot_recheck_delay"])
+
+    def on_connection_lost(self, frame, prev):
+        """Connection Lost dialog: retry TRY AGAIN up to 3 times, then escalate to a game relaunch."""
+        if not self.cfg.get("auto_reconnect", True):
+            self.log("Connection Lost detected but auto_reconnect is disabled.", "warn")
+            self.sleep(5.0)  # don't spin the loop while the dialog sits on screen
+            return
+
+        for attempt in range(1, 4):
+            try_again = self.hits.get("connection_lost_try_again_button") or self.find(frame, "connection_lost_try_again_button")
+            if try_again:
+                self.log(f"Connection Lost - clicking TRY AGAIN (attempt {attempt}/3)", "warn")
+                self.tap(try_again, 1.0)
+            else:
+                dialog = self.hits.get("connection_lost_dialog") or self.find(frame, "connection_lost_dialog")
+                if not dialog:
+                    self.log("Connection Lost cleared.", "ok")
+                    return
+                self.log(f"Connection Lost - TRY AGAIN not matched, tapping dialog (attempt {attempt}/3)", "warn")
+                self.tap(dialog, 1.0)
+            self.sleep(10.0)
+            frame = self.shot()
+            self.hits = {}
+            if not self.find(frame, "connection_lost_dialog") and not self.find(
+                    frame, "connection_lost_try_again_button"):
+                state = self.detect(frame)
+                self.log(f"Reconnected ({STATE_LABELS[state]})." if state else
+                         "Connection Lost dialog gone - resuming.", "ok")
+                return
+            self.log(f"Still disconnected after attempt {attempt}/3.", "warn")
+
+        self.log("TRY AGAIN failed 3 times - relaunching the game.", "err")
+        self.recover_game("Connection Lost would not clear after 3 retries")
 
     # --- Groq (AI vision) ---
     def groq_on(self, key):
@@ -2364,7 +2420,7 @@ class Bot:
 
     # --- Builder Base ---
     def at_village(self, f):
-        return self.find(f, "attack_button") or self.find(f, "bb_attack_button")
+        return self.find_home_attack(f) or self.find(f, "bb_attack_button")
 
     def matches(self, frame, name, conf=0.8):
         """Every place a (small) template shows, e.g. all collector bubbles - at the zoom levels a village is
@@ -2432,7 +2488,16 @@ class Bot:
                     self.sleep(1.0)
                     boat = self.find_any_zoom(self.shot(), "bb_boat") or boat
                 self.tap(boat, 2.0)
-                if self.wait_for(want, 25, poll=1.0):
+                if to == "home":
+                    end, ok = time.time() + 25, False  # either home Attack! skin counts
+                    while time.time() < end:
+                        if self.find_home_attack(self.shot()):
+                            ok = True
+                            break
+                        self.sleep(1.0)
+                else:
+                    ok = self.wait_for(want, 25, poll=1.0)
+                if ok:
                     self.sleep(1.0)
                     return True
             self.back_to_village()

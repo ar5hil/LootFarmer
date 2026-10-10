@@ -8,6 +8,12 @@ branched/forked oddly — the macOS branch briefly carried v17 then jumped to
 v19; there was never a released v18 with distinct changes beyond the security
 work listed.
 
+## v34 — 2026-10-10
+
+- New setting in Settings > Recovery: **auto_reconnect** (default on) — the bot clicks TRY AGAIN on the "Connection Lost" dialog (up to 3 attempts, 10s apart), then relaunches the game if it won't clear.
+- Connection Lost is detected before every other screen state, so the overlay always wins over dimmed buttons behind it.
+- Home village Attack! button now matches both skins: regular (`attack_button`) and the seasonal Treasure Hunt variant (`attack_button_treasure_hunt`) — either one counts as HOME everywhere (detect, village check, boat trips, attacking).
+
 ## v33 (unreleased) — 2026-10-10
 
 - New setting in Settings > Battle: **Wait after good loot before deploying (s)** (default `1.0`).
